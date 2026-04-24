@@ -1,9 +1,11 @@
 package slm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 )
 
 // ErrorCode represents error codes for LLM operations.
@@ -99,4 +101,69 @@ func IsRetryableError(err error) bool {
 		return true
 	}
 	return false
+}
+
+// WrapOperationalError normalizes transport and stream I/O failures into
+// structured LLMError values when they match known timeout, cancellation, or
+// network patterns.
+func WrapOperationalError(message string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var llmErr *LLMError
+	if errors.As(err, &llmErr) {
+		return err
+	}
+	return NewLLMError(classifyOperationalErrorCode(err), message, err)
+}
+
+func classifyOperationalErrorCode(err error) ErrorCode {
+	if err == nil {
+		return ErrCodeInternal
+	}
+	if errors.Is(err, context.Canceled) {
+		return ErrCodeCancelled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrCodeTimeout
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return ErrCodeTimeout
+		}
+		return ErrCodeNetwork
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "client.timeout"):
+		return ErrCodeTimeout
+	case strings.Contains(lower, "context deadline exceeded"):
+		return ErrCodeTimeout
+	case strings.Contains(lower, "context canceled"), strings.Contains(lower, "context cancelled"):
+		return ErrCodeCancelled
+	default:
+		return ErrCodeInternal
+	}
+}
+
+func timeoutSource(err error) string {
+	if err == nil {
+		return ""
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "client.timeout") {
+		return "http_client"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "context_deadline"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "context_cancelled"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "network_timeout"
+	}
+	return ""
 }

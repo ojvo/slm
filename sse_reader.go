@@ -1,9 +1,7 @@
 package slm
 
 import (
-	"bufio"
-	"bytes"
-	"fmt"
+	"errors"
 	"io"
 	"sync"
 )
@@ -15,23 +13,21 @@ type StreamParser func(event string, data []byte) (*Response, bool, error)
 
 // SSEReader implements StreamIterator for SSE streams
 type SSEReader struct {
-	reader       *bufio.Reader
-	parser       StreamParser
-	current      *Response
-	rawLine      []byte
-	closer       io.Closer
-	closeOnce    sync.Once
-	usage        *Usage
-	err          error
-	currentEvent string
-	dataBuffer   bytes.Buffer
-	done         bool
+	framer    *sseFrameReader
+	parser    StreamParser
+	current   *Response
+	rawLine   []byte
+	closer    io.Closer
+	closeOnce sync.Once
+	usage     *Usage
+	err       error
+	done      bool
 }
 
 // NewSSEReader creates a new SSEReader
 func NewSSEReader(r io.ReadCloser, parser StreamParser) *SSEReader {
 	return &SSEReader{
-		reader: bufio.NewReader(r),
+		framer: newSSEFrameReader(r),
 		parser: parser,
 		closer: r,
 	}
@@ -47,93 +43,34 @@ func (r *SSEReader) Next() bool {
 	}
 
 	for {
-		line, err := r.reader.ReadBytes('\n')
+		frame, ok, err := r.framer.Next()
 		if err != nil {
 			if err == io.EOF {
-				if len(line) > 0 {
-					line = bytes.TrimSuffix(line, []byte("\n"))
-					line = bytes.TrimSuffix(line, []byte("\r"))
-					if r.processLine(line) {
-						break
-					}
-				}
-				if r.err != nil {
-					return false
-				}
-				if r.dataBuffer.Len() > 0 {
-					yield, _ := r.dispatch()
-					if yield {
-						return true
-					}
-				}
 				r.done = true
 				r.Close()
 				return false
 			}
-			r.err = err
+			r.err = WrapOperationalError("stream read error", err)
 			return false
 		}
-
-		line = bytes.TrimSuffix(line, []byte("\n"))
-		line = bytes.TrimSuffix(line, []byte("\r"))
-
-		if len(line) == 0 {
-			if r.dataBuffer.Len() > 0 {
-				yield, stop := r.dispatch()
-				if stop {
-					return yield
-				}
-				if yield {
-					return true
-				}
-				continue
-			}
-			r.currentEvent = ""
-			continue
-		}
-
-		if r.processLine(line) {
-			break
-		}
-		if r.err != nil {
+		if !ok {
+			r.done = true
+			r.Close()
 			return false
 		}
-	}
-
-	if r.dataBuffer.Len() > 0 {
-		yield, _ := r.dispatch()
+		if frame.Done {
+			r.done = true
+			r.Close()
+			return false
+		}
+		yield, stop := r.dispatch(frame)
+		if stop {
+			return yield
+		}
 		if yield {
 			return true
 		}
 	}
-	r.done = true
-	r.Close()
-	return false
-}
-
-func (r *SSEReader) processLine(line []byte) bool {
-	if bytes.HasPrefix(line, []byte("event:")) {
-		r.currentEvent = string(bytes.TrimSpace(line[6:]))
-		return false
-	}
-
-	if bytes.HasPrefix(line, []byte("data:")) {
-		data := bytes.TrimSpace(line[5:])
-		if string(data) == "[DONE]" {
-			return true
-		}
-		if r.dataBuffer.Len()+len(data) > maxDataBufferSize {
-			r.err = fmt.Errorf("SSE data buffer exceeded %d bytes", maxDataBufferSize)
-			return false
-		}
-		if r.dataBuffer.Len() > 0 {
-			r.dataBuffer.WriteByte('\n')
-		}
-		r.dataBuffer.Write(data)
-		return false
-	}
-
-	return false
 }
 
 // Chunk returns the current raw line.
@@ -183,19 +120,20 @@ func (r *SSEReader) Usage() *Usage { return r.usage }
 // Response returns the current parsed response chunk.
 func (r *SSEReader) Response() *Response { return r.current }
 
-func (r *SSEReader) dispatch() (bool, bool) {
-	data := r.dataBuffer.Bytes()
-	r.dataBuffer.Reset()
-
-	resp, done, err := r.parser(r.currentEvent, data)
+func (r *SSEReader) dispatch(frame sseFrame) (bool, bool) {
+	resp, done, err := r.parser(frame.Event, frame.Data)
 	if err != nil {
-		r.err = err
+		var llmErr *LLMError
+		if errors.As(err, &llmErr) {
+			r.err = err
+		} else {
+			r.err = NewLLMError(ErrCodeParse, "parse stream event", err)
+		}
 		return false, true
 	}
 
 	r.current = resp
-	r.rawLine = make([]byte, len(data))
-	copy(r.rawLine, data)
+	r.rawLine = append(r.rawLine[:0], frame.Data...)
 
 	if resp != nil && hasUsage(resp.Usage) {
 		r.usage = &resp.Usage

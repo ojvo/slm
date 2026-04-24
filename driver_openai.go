@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 // OpenAIEngine OpenAI 协议驱动。
@@ -14,6 +16,14 @@ import (
 type OpenAIEngine struct {
 	transport    Transport
 	defaultModel string
+	capabilities *CapabilityNegotiationOptions
+	logger       Logger
+}
+
+type OpenAIOptions struct {
+	DefaultModel string
+	Capabilities *CapabilityNegotiationOptions
+	Logger       Logger
 }
 
 // NewOpenAIProtocol 创建 OpenAI 协议引擎（使用标准 HTTP 传输）。
@@ -22,6 +32,11 @@ func NewOpenAIProtocol(baseURL, apiKey, defaultModel string) Engine {
 		transport:    NewHTTPTransport(baseURL, apiKey),
 		defaultModel: defaultModel,
 	}
+}
+
+// NewOpenAIProtocolWithOptions creates an OpenAI protocol engine with optional capability negotiation.
+func NewOpenAIProtocolWithOptions(baseURL, apiKey string, opts OpenAIOptions) Engine {
+	return NewOpenAIWithTransportAndOptions(NewHTTPTransport(baseURL, apiKey), opts)
 }
 
 // NewOpenAIWithTransport 创建使用自定义 Transport 的 OpenAI 协议引擎。
@@ -43,43 +58,144 @@ func NewOpenAIWithTransport(transport Transport, defaultModel string) Engine {
 	}
 }
 
+// NewOpenAIWithTransportAndOptions creates an OpenAI protocol engine with optional capability negotiation.
+func NewOpenAIWithTransportAndOptions(transport Transport, opts OpenAIOptions) Engine {
+	engine := &OpenAIEngine{transport: transport, defaultModel: opts.DefaultModel, logger: opts.Logger}
+	if opts.Capabilities != nil {
+		clone := *opts.Capabilities
+		if clone.DefaultModel == "" {
+			clone.DefaultModel = opts.DefaultModel
+		}
+		engine.capabilities = &clone
+	}
+	return engine
+}
+
 const maxResponseSize = 50 * 1024 * 1024 // 50MB
 
 // Generate 生成完整响应
 func (e *OpenAIEngine) Generate(ctx context.Context, req *Request) (*Response, error) {
-	resp, err := e.doRequest(ctx, req, false)
+	effectiveReq := normalizeRequestForOperation(req, e.defaultModel, false)
+	requestID := GetRequestID(ctx)
+	start := time.Now()
+	e.logDebug("LLM request start", append([]any{"request_id", requestID}, RequestDiagnosticFields(effectiveReq)...)...)
+	resp, err := e.doRequest(ctx, effectiveReq, false)
 	if err != nil {
+		e.logError("LLM request failed", start, requestID, effectiveReq, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, NewLLMError(classifyHTTPError(resp.StatusCode, bodyBytes), fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(bodyBytes)), nil)
+		err := NewLLMError(classifyHTTPError(resp.StatusCode, bodyBytes), fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(bodyBytes)), nil)
+		e.logError("LLM request failed", start, requestID, effectiveReq, err)
+		return nil, err
 	}
 
 	var oaiResp oaiResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseSize)).Decode(&oaiResp); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+		wrapped := fmt.Errorf("decode response: %w", err)
+		e.logError("LLM request failed", start, requestID, effectiveReq, wrapped)
+		return nil, wrapped
 	}
 
-	return e.convertResponse(&oaiResp), nil
+	result := e.convertResponse(&oaiResp)
+	e.logDebug("LLM request completed", "duration", time.Since(start), "request_id", requestID, "model", effectiveReq.Model, "finish_reason", result.FinishReason, "tokens", result.Usage.TotalTokens)
+	return result, nil
 }
 
 // Stream 流式生成
 func (e *OpenAIEngine) Stream(ctx context.Context, req *Request) (StreamIterator, error) {
-	resp, err := e.doRequest(ctx, req, true)
+	effectiveReq := normalizeRequestForOperation(req, e.defaultModel, true)
+	requestID := GetRequestID(ctx)
+	start := time.Now()
+	e.logDebug("LLM stream start", append([]any{"request_id", requestID}, RequestDiagnosticFields(effectiveReq)...)...)
+	resp, err := e.doRequest(ctx, effectiveReq, true)
 	if err != nil {
+		e.logError("LLM stream failed", start, requestID, effectiveReq, err)
 		return nil, err
 	}
 
 	if resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		resp.Body.Close()
-		return nil, NewLLMError(classifyHTTPError(resp.StatusCode, bodyBytes), fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(bodyBytes)), nil)
+		err := NewLLMError(classifyHTTPError(resp.StatusCode, bodyBytes), fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(bodyBytes)), nil)
+		e.logError("LLM stream failed", start, requestID, effectiveReq, err)
+		return nil, err
 	}
 
-	return NewSSEReader(resp.Body, e.parseSSEChunk), nil
+	e.logDebug("LLM stream connected", "duration", time.Since(start), "request_id", requestID, "model", effectiveReq.Model)
+	return &loggingOpenAIStreamIterator{inner: NewSSEReader(resp.Body, e.parseSSEChunk), logger: e.logger, start: start, requestID: requestID, request: cloneRequest(effectiveReq)}, nil
+}
+
+func (e *OpenAIEngine) logDebug(msg string, args ...any) {
+	if e.logger == nil {
+		return
+	}
+	e.logger.Debug(msg, args...)
+}
+
+func (e *OpenAIEngine) logError(msg string, start time.Time, requestID string, req *Request, err error) {
+	if e.logger == nil {
+		return
+	}
+	args := append([]any{"duration", time.Since(start), "request_id", requestID}, RequestDiagnosticFields(req)...)
+	args = append(args, ErrorDiagnosticFields(err)...)
+	e.logger.Error(msg, args...)
+}
+
+type loggingOpenAIStreamIterator struct {
+	inner     StreamIterator
+	logger    Logger
+	start     time.Time
+	requestID string
+	request   *Request
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (l *loggingOpenAIStreamIterator) Next() bool {
+	ok := l.inner.Next()
+	if !ok {
+		_ = l.Close()
+	}
+	return ok
+}
+
+func (l *loggingOpenAIStreamIterator) Chunk() []byte       { return l.inner.Chunk() }
+func (l *loggingOpenAIStreamIterator) Text() string        { return l.inner.Text() }
+func (l *loggingOpenAIStreamIterator) FullText() string    { return l.inner.FullText() }
+func (l *loggingOpenAIStreamIterator) Err() error          { return l.inner.Err() }
+func (l *loggingOpenAIStreamIterator) Usage() *Usage       { return l.inner.Usage() }
+func (l *loggingOpenAIStreamIterator) Response() *Response { return l.inner.Response() }
+
+func (l *loggingOpenAIStreamIterator) Close() error {
+	l.closeOnce.Do(func() {
+		l.closeErr = l.inner.Close()
+		if l.logger == nil {
+			return
+		}
+		duration := time.Since(l.start)
+		if l.closeErr != nil {
+			args := append([]any{"duration", duration, "request_id", l.requestID}, RequestDiagnosticFields(l.request)...)
+			args = append(args, ErrorDiagnosticFields(l.closeErr)...)
+			l.logger.Error("LLM stream closed with error", args...)
+			return
+		}
+		if err := l.inner.Err(); err != nil {
+			args := append([]any{"duration", duration, "request_id", l.requestID}, RequestDiagnosticFields(l.request)...)
+			args = append(args, ErrorDiagnosticFields(err)...)
+			l.logger.Error("LLM stream closed with error", args...)
+			return
+		}
+		args := []any{"duration", duration, "request_id", l.requestID}
+		if usage := l.inner.Usage(); usage != nil {
+			args = append(args, "tokens", usage.TotalTokens)
+		}
+		l.logger.Debug("LLM stream completed", args...)
+	})
+	return l.closeErr
 }
 
 func (e *OpenAIEngine) doRequest(ctx context.Context, req *Request, stream bool) (*http.Response, error) {
@@ -89,6 +205,13 @@ func (e *OpenAIEngine) doRequest(ctx context.Context, req *Request, stream bool)
 
 	if len(req.Messages) == 0 {
 		return nil, NewLLMError(ErrCodeInvalidConfig, "messages is required", nil)
+	}
+	if e.capabilities != nil && e.capabilities.Resolver != nil {
+		var err error
+		ctx, req, err = NegotiateRequestCapabilities(ctx, req, *e.capabilities)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	model := e.resolveModel(req.Model)
@@ -493,6 +616,9 @@ func classifyHTTPError(statusCode int, body []byte) ErrorCode {
 		}
 		if strings.Contains(bodyStr, "content_filter") || strings.Contains(bodyStr, "content policy") {
 			return ErrCodeContentFilter
+		}
+		if strings.Contains(bodyStr, "unsupported_api_for_model") || strings.Contains(bodyStr, "not supported via responses api") || strings.Contains(bodyStr, "not supported via chat completions api") {
+			return ErrCodeUnsupportedCapability
 		}
 		if strings.Contains(bodyStr, "unknown_model") || strings.Contains(bodyStr, "model_not_found") {
 			return ErrCodeInvalidModel

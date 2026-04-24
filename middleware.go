@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,12 +19,13 @@ type RateLimitConfig struct {
 // StandardMiddlewareOptions defines the recommended default middleware stack.
 //
 // Middleware order is fixed as:
-// request id -> capability negotiation -> lifecycle observers -> logging -> timeout -> retry -> rate limit -> engine
+// request id -> request normalization -> capability negotiation -> lifecycle observers -> logging -> timeout -> retry -> rate limit -> engine
 //
 // This keeps request correlation visible in logs, bounds total request time,
 // applies retries within the timeout window, and charges rate limits per
 // underlying attempt rather than per logical request.
 type StandardMiddlewareOptions struct {
+	DefaultModel       string
 	Capabilities       *CapabilityNegotiationOptions
 	Observers          []LifecycleObserver
 	Logger             Logger
@@ -81,6 +83,9 @@ func ApplyStandardMiddleware(engine Engine, opts StandardMiddlewareOptions) Engi
 		streamMiddlewares = append(streamMiddlewares, RequestIDStreamMiddleware(opts.RequestIDGenerator))
 	}
 
+	middlewares = append(middlewares, NormalizeRequestMiddleware(opts.DefaultModel))
+	streamMiddlewares = append(streamMiddlewares, NormalizeRequestStreamMiddleware(opts.DefaultModel))
+
 	if opts.Capabilities != nil && opts.Capabilities.Resolver != nil {
 		capUnary, capStream := CapabilityNegotiationMiddleware(*opts.Capabilities)
 		middlewares = append(middlewares, capUnary)
@@ -122,6 +127,26 @@ func ApplyStandardMiddleware(engine Engine, opts StandardMiddlewareOptions) Engi
 	}
 
 	return ChainWithStreamAndClosers(engine, middlewares, streamMiddlewares, closers)
+}
+
+// NormalizeRequestMiddleware ensures diagnostics and downstream middleware see
+// the effective request shape for unary operations.
+func NormalizeRequestMiddleware(defaultModel string) Middleware {
+	return func(next Handler) Handler {
+		return func(ctx context.Context, req *Request) (*Response, error) {
+			return next(ctx, normalizeRequestForOperation(req, defaultModel, false))
+		}
+	}
+}
+
+// NormalizeRequestStreamMiddleware ensures diagnostics and downstream middleware
+// see the effective request shape for stream operations.
+func NormalizeRequestStreamMiddleware(defaultModel string) StreamMiddleware {
+	return func(next StreamHandler) StreamHandler {
+		return func(ctx context.Context, req *Request) (StreamIterator, error) {
+			return next(ctx, normalizeRequestForOperation(req, defaultModel, true))
+		}
+	}
 }
 
 type middlewareEngine struct {
@@ -295,14 +320,16 @@ func LoggingMiddleware(logger Logger) Middleware {
 	return func(next Handler) Handler {
 		return func(ctx context.Context, req *Request) (*Response, error) {
 			requestID := GetRequestID(ctx)
-			logger.Debug("LLM request start", "model", requestModel(req), "request_id", requestID)
+			logger.Debug("LLM request start", append([]any{"request_id", requestID}, RequestDiagnosticFields(req)...)...)
 			start := time.Now()
 
 			resp, err := next(ctx, req)
 
 			duration := time.Since(start)
 			if err != nil {
-				logger.Error("LLM request failed", "error", err, "duration", duration, "request_id", requestID)
+				args := append([]any{"duration", duration, "request_id", requestID}, RequestDiagnosticFields(req)...)
+				args = append(args, ErrorDiagnosticFields(err)...)
+				logger.Error("LLM request failed", args...)
 			} else if resp != nil {
 				logger.Debug("LLM request completed",
 					"duration", duration,
@@ -326,16 +353,17 @@ func LoggingStreamMiddleware(logger Logger) StreamMiddleware {
 	}
 	return func(next StreamHandler) StreamHandler {
 		return func(ctx context.Context, req *Request) (StreamIterator, error) {
-			model := requestModel(req)
 			requestID := GetRequestID(ctx)
-			logger.Debug("LLM stream start", "model", model, "request_id", requestID)
+			logger.Debug("LLM stream start", append([]any{"request_id", requestID}, RequestDiagnosticFields(req)...)...)
 			start := time.Now()
 
 			iter, err := next(ctx, req)
 
 			duration := time.Since(start)
 			if err != nil {
-				logger.Error("LLM stream failed", "error", err, "duration", duration, "request_id", requestID)
+				args := append([]any{"duration", duration, "request_id", requestID}, RequestDiagnosticFields(req)...)
+				args = append(args, ErrorDiagnosticFields(err)...)
+				logger.Error("LLM stream failed", args...)
 				return nil, err
 			}
 
@@ -345,7 +373,8 @@ func LoggingStreamMiddleware(logger Logger) StreamMiddleware {
 				inner:     iter,
 				logger:    logger,
 				start:     start,
-				model:     model,
+				model:     requestModel(req),
+				request:   cloneRequest(req),
 				requestID: requestID,
 			}, nil
 		}
@@ -357,6 +386,7 @@ type loggingStreamIterator struct {
 	logger    Logger
 	start     time.Time
 	model     string
+	request   *Request
 	requestID string
 	closeOnce sync.Once
 	closeErr  error
@@ -383,7 +413,9 @@ func (l *loggingStreamIterator) Close() error {
 		duration := time.Since(l.start)
 
 		if l.closeErr != nil {
-			l.logger.Error("LLM stream closed with error", "error", l.closeErr, "duration", duration, "model", l.model, "request_id", l.requestID)
+			args := append([]any{"duration", duration, "request_id", l.requestID}, RequestDiagnosticFields(l.request)...)
+			args = append(args, ErrorDiagnosticFields(l.closeErr)...)
+			l.logger.Error("LLM stream closed with error", args...)
 		} else if usage != nil {
 			l.logger.Debug("LLM stream completed",
 				"duration", duration,
@@ -515,9 +547,11 @@ func RequestIDMiddleware(generator func() string) Middleware {
 	}
 	return func(next Handler) Handler {
 		return func(ctx context.Context, req *Request) (*Response, error) {
-			reqID := generator()
-
-			ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
+			reqID := GetRequestID(ctx)
+			if reqID == "" {
+				reqID = generator()
+				ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
+			}
 
 			cloned := cloneRequest(req)
 			if cloned == nil {
@@ -554,9 +588,11 @@ func RequestIDStreamMiddleware(generator func() string) StreamMiddleware {
 	}
 	return func(next StreamHandler) StreamHandler {
 		return func(ctx context.Context, req *Request) (StreamIterator, error) {
-			reqID := generator()
-
-			ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
+			reqID := GetRequestID(ctx)
+			if reqID == "" {
+				reqID = generator()
+				ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
+			}
 
 			cloned := cloneRequest(req)
 			if cloned == nil {
@@ -620,11 +656,34 @@ func GetRequestID(ctx context.Context) string {
 	return ""
 }
 
+// WithRequestID stores a request id in context so logs, observers, and
+// middleware can correlate work even when requests originate outside the
+// standard slm middleware chain.
+func WithRequestID(ctx context.Context, requestID string) context.Context {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyRequestID{}, requestID)
+}
+
 func requestModel(req *Request) string {
 	if req == nil {
 		return ""
 	}
 	return req.Model
+}
+
+func normalizeRequestForOperation(req *Request, defaultModel string, stream bool) *Request {
+	if req == nil {
+		return nil
+	}
+	clone := cloneRequest(req)
+	clone.Stream = stream
+	if strings.TrimSpace(clone.Model) == "" {
+		clone.Model = strings.TrimSpace(defaultModel)
+	}
+	return clone
 }
 
 func interruptStreamIterator(iter StreamIterator, err error) {

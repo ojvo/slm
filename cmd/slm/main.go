@@ -36,6 +36,7 @@ func main() {
 		"    json_mode      Force JSON output format\n\n"+
 		"  02-ADVANCED (高级)\n"+
 		"    streaming      Real-time stream output\n"+
+		"    responses      OpenAI responses API\n"+
 		"    tool_calling   Multi-tool definition and execution\n"+
 		"    generic        Type-safe Call[T] generics\n"+
 		"    reasoning      o1/o3 reasoning content extraction\n\n"+
@@ -85,6 +86,8 @@ func main() {
 
 	case "streaming":
 		runStreaming(ctx, engine)
+	case "responses":
+		runResponses(ctx)
 	case "tool_calling":
 		runToolCalling(ctx, engine)
 	case "generic":
@@ -146,6 +149,7 @@ func runAll(ctx context.Context, engine slm.Engine) {
 		{"parameters", func() { runParameters(ctx, engine) }},
 		{"json_mode", func() { runJSONMode(ctx, engine) }},
 		{"streaming", func() { runStreaming(ctx, engine) }},
+		{"responses", func() { runResponses(ctx) }},
 		{"tool_calling", func() { runToolCalling(ctx, engine) }},
 		{"generic", func() { runGeneric(ctx, engine) }},
 		{"reasoning", func() { runReasoning(ctx, engine) }},
@@ -352,6 +356,55 @@ func runStreaming(ctx context.Context, engine slm.Engine) {
 		fmt.Printf("Usage: prompt=%d completion=%d\n",
 			usage.PromptTokens, usage.CompletionTokens)
 	}
+}
+
+func runResponses(ctx context.Context) {
+	fmt.Println("========================================")
+	fmt.Println("  RESPONSES: OpenAI Responses API")
+	fmt.Println("========================================")
+
+	engine := slm.NewOpenAIResponsesProtocolWithOptions(
+		"https://models.inference.ai.azure.com",
+		getAPIKey(),
+		slm.OpenAIResponsesOptions{
+			DefaultModel: "gpt-4o-mini",
+			Capabilities: &slm.CapabilityNegotiationOptions{
+				Resolver: slm.StaticCapabilityResolver{
+					"gpt-4o-mini": {
+						Supports: slm.CapabilitySet{JSONMode: true, ToolCalls: true, Reasoning: true},
+					},
+				},
+				DefaultModel: "gpt-4o-mini",
+				RequireKnown: true,
+			},
+		},
+	)
+
+	resp, err := engine.Create(ctx, &slm.ResponseRequest{
+		Input: []slm.ResponseInputItem{{
+			Role:    "user",
+			Content: "Return compact JSON with keys summary and use_case for Go interfaces.",
+		}},
+		Reasoning: &slm.ResponseReasoning{Effort: "medium"},
+	})
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Status: %s\n", resp.Status)
+	fmt.Printf("Model: %s\n", resp.Model)
+	for _, item := range resp.Output {
+		for _, content := range item.Content {
+			if content.Text != "" {
+				fmt.Printf("Output: %s\n", content.Text)
+			}
+		}
+	}
+	if resp.Usage != nil {
+		fmt.Printf("Usage: input=%d output=%d total=%d\n", resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.Usage.TotalTokens)
+	}
+	fmt.Println("✓ /responses now demonstrates the same explicit capability negotiation entry as chat")
 }
 
 func runToolCalling(ctx context.Context, engine slm.Engine) {
@@ -798,12 +851,19 @@ func runCapabilities(ctx context.Context, engine slm.Engine) {
 	fmt.Println("  1. Copilot model catalog bridge -> slm.CapabilityResolver")
 	fmt.Println("  2. Generic slm fallback for unknown models")
 
-	wrapped := slm.ApplyStandardMiddleware(engine, slm.StandardMiddlewareOptions{
-		Capabilities: &slm.CapabilityNegotiationOptions{
-			Resolver:     resolver,
+	capabilityEngine := slm.NewOpenAIProtocolWithOptions(
+		"https://models.inference.ai.azure.com",
+		getAPIKey(),
+		slm.OpenAIOptions{
 			DefaultModel: "gpt-4o-mini",
-			RequireKnown: true,
+			Capabilities: &slm.CapabilityNegotiationOptions{
+				Resolver:     resolver,
+				DefaultModel: "gpt-4o-mini",
+				RequireKnown: true,
+			},
 		},
+	)
+	wrapped := slm.ApplyStandardMiddleware(capabilityEngine, slm.StandardMiddlewareOptions{
 		Observers: []slm.LifecycleObserver{capabilityPrinterObserver{}},
 	})
 

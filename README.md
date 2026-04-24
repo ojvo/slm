@@ -70,6 +70,59 @@ for iter.Next() {
 }
 ```
 
+### Responses API
+
+当上游支持 OpenAI `/responses` 协议时，可以直接使用 `OpenAIResponsesEngine`：
+
+```go
+engine := slm.NewOpenAIResponsesProtocol(
+    "https://api.openai.com/v1",
+    "your-api-key",
+    "gpt-4o-mini",
+)
+
+resp, err := engine.Create(ctx, &slm.ResponseRequest{
+    Input: []slm.ResponseInputItem{{
+        Role:    "user",
+        Content: "Summarize Go interfaces in one sentence.",
+    }},
+})
+if err != nil {
+    panic(err)
+}
+
+for _, item := range resp.Output {
+    for _, content := range item.Content {
+        fmt.Println(content.Text)
+    }
+}
+```
+
+如果需要流式 `/responses`：
+
+```go
+stream, err := engine.Stream(ctx, &slm.ResponseRequest{
+    Input: []slm.ResponseInputItem{{
+        Role:    "user",
+        Content: "List three benefits of explicit capability negotiation.",
+    }},
+})
+if err != nil {
+    panic(err)
+}
+defer stream.Close()
+
+for stream.Next() {
+    event := stream.Current()
+    if event.Delta != "" {
+        fmt.Print(event.Delta)
+    }
+}
+if err := stream.Err(); err != nil {
+    panic(err)
+}
+```
+
 ### 类型安全调用
 
 ```go
@@ -117,7 +170,7 @@ SLM 采用**协议-传输分离**设计：`OpenAIEngine` 只负责 OpenAI 协议
 
 ```go
 type Transport interface {
-    Do(ctx context.Context, method, path string, headers map[string]string, body any) (*http.Response, error)
+    Do(ctx context.Context, method, path string, headers map[string]string, body []byte) (*http.Response, error)
 }
 ```
 
@@ -319,18 +372,13 @@ engine := slm.ChainWithStream(baseEngine,
 
 ### 标准中间件链
 
+能力协商现在更推荐直接配置在协议 engine 或 `Config.BuildEngineWithTransport()` 上；标准链主要负责 request id、observer、logging、timeout、retry、rate limit 这类横切能力。只有在你需要包装一个已经存在、但本身不支持协议级协商的通用 engine 时，才需要把 capability negotiation 继续放在 middleware 层。
+
 如果没有非常特殊的排序需求，优先使用标准链构建器：
 
 ```go
 engine := slm.ApplyStandardMiddleware(baseEngine, slm.StandardMiddlewareOptions{
     EnableRequestID: true,
-    Capabilities: &slm.CapabilityNegotiationOptions{
-        Resolver: slm.StaticCapabilityResolver{
-            "gpt-4o-mini": {Supports: slm.CapabilitySet{JSONMode: true, ToolCalls: true, Vision: true, Reasoning: true}},
-        },
-        DefaultModel: "gpt-4o-mini",
-        RequireKnown: true,
-    },
     Logger:          logger,
     Timeout:         30 * time.Second,
     Retry:           &slm.RetryConfig{MaxAttempts: 3},
@@ -404,12 +452,56 @@ resolver := slm.StaticCapabilityResolver{
     },
 }
 
+engine := slm.NewOpenAIProtocolWithOptions(
+    "https://api.openai.com/v1",
+    apiKey,
+    slm.OpenAIOptions{
+        DefaultModel: "gpt-4o-mini",
+        Capabilities: &slm.CapabilityNegotiationOptions{
+            Resolver:     resolver,
+            RequireKnown: true,
+        },
+    },
+)
+
 cfg := slm.DefaultConfig().
-    WithProvider(slm.ProviderConfig{DefaultModel: "gpt-4o-mini"}).
+    WithProvider(slm.ProviderConfig{
+        Endpoint:     "https://api.openai.com/v1",
+        APIKey:       apiKey,
+        DefaultModel: "gpt-4o-mini",
+    }).
     WithCapabilityNegotiation(slm.CapabilityNegotiationOptions{
         Resolver:     resolver,
         RequireKnown: true,
     })
+
+engineFromConfig, err := cfg.BuildEngineWithTransport()
+```
+
+`BuildEngineWithTransport()` 在检测到 capability negotiation 配置时，会自动构造带协议级协商的 OpenAI engine，而不是再额外包一层 capability middleware。
+
+`/responses` 也是同一套协商入口，对应 engine 写法如下：
+
+```go
+responses := slm.NewOpenAIResponsesProtocolWithOptions(
+    "https://api.openai.com/v1",
+    apiKey,
+    slm.OpenAIResponsesOptions{
+        DefaultModel: "gpt-4o-mini",
+        Capabilities: &slm.CapabilityNegotiationOptions{
+            Resolver:     resolver,
+            RequireKnown: true,
+        },
+    },
+)
+
+resp, err := responses.Create(ctx, &slm.ResponseRequest{
+    Input: []slm.ResponseInputItem{{
+        Role:    "user",
+        Content: "Return JSON with keys summary and use_case.",
+    }},
+    Reasoning: &slm.ResponseReasoning{Effort: "medium"},
+})
 ```
 
 请求能力会自动从请求结构中识别：
@@ -466,14 +558,39 @@ resolver := slm.NewCatalogCapabilityResolver(loadCatalog, slm.CapabilityCatalogR
     AllowStaleOnError: true,
 })
 
+baseEngine := slm.NewOpenAIProtocolWithOptions(
+    "https://api.openai.com/v1",
+    apiKey,
+    slm.OpenAIOptions{
+        DefaultModel: "gpt-4o-mini",
+        Capabilities: &slm.CapabilityNegotiationOptions{
+            Resolver:     resolver,
+            DefaultModel: "gpt-4o-mini",
+            RequireKnown: true,
+        },
+    },
+)
+
+engine := slm.ApplyStandardMiddleware(baseEngine, slm.StandardMiddlewareOptions{
+    EnableRequestID: true,
+    Timeout:         30 * time.Second,
+    Retry:           &slm.RetryConfig{MaxAttempts: 3},
+    RateLimit:       &slm.RateLimitConfig{Limit: 10, Burst: 5},
+    Logger:          logger,
+    Observers: []slm.LifecycleObserver{
+        slm.NewMetricsObserver(meter, slm.MetricsObserverOptions{Namespace: "slm"}),
+    },
+})
+```
+
+如果你必须给一个已有的通用 engine 追加能力协商，而没法重新构造协议 engine，也可以继续使用 middleware 形式：
+
+```go
 engine := slm.ApplyStandardMiddleware(baseEngine, slm.StandardMiddlewareOptions{
     Capabilities: &slm.CapabilityNegotiationOptions{
         Resolver:     resolver,
         DefaultModel: "gpt-4o-mini",
         RequireKnown: true,
-    },
-    Observers: []slm.LifecycleObserver{
-        slm.NewMetricsObserver(meter, slm.MetricsObserverOptions{Namespace: "slm"}),
     },
 })
 ```
@@ -486,6 +603,7 @@ engine := slm.ApplyStandardMiddleware(baseEngine, slm.StandardMiddlewareOptions{
 cfg := slm.DefaultConfig().
     WithProvider(slm.ProviderConfig{
         Endpoint:     "https://api.openai.com/v1",
+        APIKey:       apiKey,
         DefaultModel: "gpt-4o-mini",
     }).
     WithCapabilityNegotiation(slm.CapabilityNegotiationOptions{
@@ -505,7 +623,11 @@ cfg := slm.DefaultConfig().
 engine, err := cfg.BuildEngine(func(p slm.ProviderConfig) (slm.Engine, error) {
     return slm.NewOpenAIProtocol(p.Endpoint, apiKey, p.DefaultModel), nil
 })
+
+engineWithTransport, err := cfg.BuildEngineWithTransport()
 ```
+
+如果你本来就是在用 OpenAI 兼容协议，优先使用 `BuildEngineWithTransport()`，因为这条路径会把 capability negotiation 直接下沉到协议 engine；`BuildEngine(...)` 仍然适合非 OpenAI 协议或完全自定义的 engine 工厂。
 
 ## 工具调用
 
@@ -601,6 +723,7 @@ go run ./cmd/slm -example streaming
 go run ./cmd/slm -example json_mode
 
 # 高级示例
+go run ./cmd/slm -example responses
 go run ./cmd/slm -example tool_calling
 go run ./cmd/slm -example generic
 go run ./cmd/slm -example reasoning

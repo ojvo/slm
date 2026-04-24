@@ -189,9 +189,10 @@ type NegotiatedCapabilities struct {
 
 // CapabilityNegotiationOptions configures explicit model capability validation.
 type CapabilityNegotiationOptions struct {
-	Resolver     CapabilityResolver
-	DefaultModel string
-	RequireKnown bool
+	Resolver          CapabilityResolver
+	DefaultModel      string
+	RequireKnown      bool
+	RequireKnownModel bool
 }
 
 // DetectRequestedCapabilities extracts the capability requirements implied by a request.
@@ -218,6 +219,17 @@ func DetectRequestedCapabilities(req *Request) CapabilitySet {
 	return requested
 }
 
+// DetectRequestedResponseCapabilities extracts the capability requirements implied by a responses request.
+func DetectRequestedResponseCapabilities(req *ResponseRequest) CapabilitySet {
+	if req == nil {
+		return CapabilitySet{}
+	}
+	return CapabilitySet{
+		ToolCalls: len(req.Tools) > 0,
+		Reasoning: req.Reasoning != nil || hasLegacyReasoningRequest(req.ExtraBody),
+	}
+}
+
 // CapabilityNegotiationMiddleware validates explicit request requirements against model capabilities.
 func CapabilityNegotiationMiddleware(opts CapabilityNegotiationOptions) (Middleware, StreamMiddleware) {
 	passUnary := func(next Handler) Handler { return next }
@@ -227,65 +239,7 @@ func CapabilityNegotiationMiddleware(opts CapabilityNegotiationOptions) (Middlew
 	}
 
 	negotiate := func(ctx context.Context, req *Request) (context.Context, *Request, error) {
-		if req == nil {
-			return ctx, req, nil
-		}
-
-		model := req.Model
-		if model == "" {
-			model = opts.DefaultModel
-		}
-
-		requested := DetectRequestedCapabilities(req)
-		if model == "" {
-			if requested.Any() {
-				return ctx, req, NewLLMError(ErrCodeUnsupportedCapability, "cannot negotiate capabilities without a model", nil)
-			}
-			return withNegotiatedCapabilities(ctx, NegotiatedCapabilities{Requested: requested}), req, nil
-		}
-
-		var (
-			caps  ModelCapabilities
-			known bool
-			state CapabilityResolverState
-			err   error
-		)
-		if withState, ok := opts.Resolver.(CapabilityResolverWithState); ok {
-			caps, known, state, err = withState.ResolveCapabilitiesWithState(ctx, model)
-		} else {
-			caps, known, err = opts.Resolver.ResolveCapabilities(ctx, model)
-		}
-		if err != nil {
-			return ctx, req, err
-		}
-
-		negotiated := NegotiatedCapabilities{
-			Model:     model,
-			Requested: requested,
-			Known:     known,
-			State:     state,
-			Stale:     state.Stale,
-		}
-		if known {
-			if caps.Model == "" {
-				caps.Model = model
-			}
-			negotiated.Model = caps.Model
-			negotiated.Supported = caps.Supports
-			if missing := caps.Supports.missing(requested); len(missing) > 0 {
-				return ctx, req, NewLLMError(ErrCodeUnsupportedCapability, fmt.Sprintf("model %q does not support %s", caps.Model, strings.Join(missing, ", ")), nil)
-			}
-		} else if opts.RequireKnown && requested.Any() {
-			return ctx, req, NewLLMError(ErrCodeUnsupportedCapability, fmt.Sprintf("capabilities for model %q are unknown", model), nil)
-		}
-
-		if req.Model == "" && model != "" {
-			clone := cloneRequest(req)
-			clone.Model = model
-			req = clone
-		}
-
-		return withNegotiatedCapabilities(ctx, negotiated), req, nil
+		return NegotiateRequestCapabilities(ctx, req, opts)
 	}
 
 	unary := func(next Handler) Handler {
@@ -309,6 +263,97 @@ func CapabilityNegotiationMiddleware(opts CapabilityNegotiationOptions) (Middlew
 	}
 
 	return unary, stream
+}
+
+// NegotiateRequestCapabilities validates and injects chat request capability negotiation state.
+//
+// This helper exposes the same capability negotiation logic used by middleware so callers can
+// apply explicit model validation closer to a transport or protocol implementation when needed.
+func NegotiateRequestCapabilities(ctx context.Context, req *Request, opts CapabilityNegotiationOptions) (context.Context, *Request, error) {
+	if req == nil || opts.Resolver == nil {
+		return ctx, req, nil
+	}
+	requested := DetectRequestedCapabilities(req)
+	ctx, model, err := negotiateCapabilities(ctx, req.Model, requested, opts)
+	if err != nil {
+		return ctx, req, err
+	}
+	if req.Model == "" && model != "" {
+		clone := cloneRequest(req)
+		clone.Model = model
+		req = clone
+	}
+	return ctx, req, nil
+}
+
+// NegotiateResponseCapabilities validates and injects responses request capability negotiation state.
+func NegotiateResponseCapabilities(ctx context.Context, req *ResponseRequest, opts CapabilityNegotiationOptions) (context.Context, *ResponseRequest, error) {
+	if req == nil || opts.Resolver == nil {
+		return ctx, req, nil
+	}
+	requested := DetectRequestedResponseCapabilities(req)
+	ctx, model, err := negotiateCapabilities(ctx, req.Model, requested, opts)
+	if err != nil {
+		return ctx, req, err
+	}
+	if req.Model == "" && model != "" {
+		clone := cloneResponseRequest(req)
+		clone.Model = model
+		req = clone
+	}
+	return ctx, req, nil
+}
+
+func negotiateCapabilities(ctx context.Context, requestedModel string, requested CapabilitySet, opts CapabilityNegotiationOptions) (context.Context, string, error) {
+	model := requestedModel
+	if model == "" {
+		model = opts.DefaultModel
+	}
+
+	if model == "" {
+		if requested.Any() || opts.RequireKnownModel {
+			return ctx, model, NewLLMError(ErrCodeUnsupportedCapability, "cannot negotiate capabilities without a model", nil)
+		}
+		return withNegotiatedCapabilities(ctx, NegotiatedCapabilities{Requested: requested}), model, nil
+	}
+
+	var (
+		caps  ModelCapabilities
+		known bool
+		state CapabilityResolverState
+		err   error
+	)
+	if withState, ok := opts.Resolver.(CapabilityResolverWithState); ok {
+		caps, known, state, err = withState.ResolveCapabilitiesWithState(ctx, model)
+	} else {
+		caps, known, err = opts.Resolver.ResolveCapabilities(ctx, model)
+	}
+	if err != nil {
+		return ctx, model, err
+	}
+
+	negotiated := NegotiatedCapabilities{
+		Model:     model,
+		Requested: requested,
+		Known:     known,
+		State:     state,
+		Stale:     state.Stale,
+	}
+	if known {
+		if caps.Model == "" {
+			caps.Model = model
+		}
+		model = caps.Model
+		negotiated.Model = caps.Model
+		negotiated.Supported = caps.Supports
+		if missing := caps.Supports.missing(requested); len(missing) > 0 {
+			return ctx, model, NewLLMError(ErrCodeUnsupportedCapability, fmt.Sprintf("model %q does not support %s", caps.Model, strings.Join(missing, ", ")), nil)
+		}
+	} else if opts.RequireKnownModel || (opts.RequireKnown && requested.Any()) {
+		return ctx, model, NewLLMError(ErrCodeUnsupportedCapability, fmt.Sprintf("capabilities for model %q are unknown", model), nil)
+	}
+
+	return withNegotiatedCapabilities(ctx, negotiated), model, nil
 }
 
 func hasLegacyReasoningRequest(extraBody map[string]any) bool {

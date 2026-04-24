@@ -87,7 +87,7 @@ func (c Config) BuildEngine(createEngine func(ProviderConfig) (Engine, error)) (
 	if err != nil {
 		return nil, err
 	}
-	return c.applyMiddleware(engine), nil
+	return c.applyMiddleware(engine, true), nil
 }
 
 // BuildEngineWithTransport 根据配置和 Transport 构建 Engine。
@@ -95,11 +95,19 @@ func (c Config) BuildEngine(createEngine func(ProviderConfig) (Engine, error)) (
 // 否则使用 ProviderConfig 的 Endpoint/APIKey 创建 HTTP 传输。
 func (c Config) BuildEngineWithTransport() (Engine, error) {
 	var engine Engine
+	capabilities := c.resolvedCapabilities()
 	if c.Transport != nil {
 		if c.Provider.DefaultModel == "" {
 			return nil, NewLLMError(ErrCodeInvalidConfig, "DefaultModel is required when using custom Transport", nil)
 		}
-		engine = NewOpenAIWithTransport(c.Transport, c.Provider.DefaultModel)
+		if capabilities != nil {
+			engine = NewOpenAIWithTransportAndOptions(c.Transport, OpenAIOptions{
+				DefaultModel: c.Provider.DefaultModel,
+				Capabilities: capabilities,
+			})
+		} else {
+			engine = NewOpenAIWithTransport(c.Transport, c.Provider.DefaultModel)
+		}
 	} else {
 		if c.Provider.Endpoint == "" {
 			return nil, NewLLMError(ErrCodeInvalidConfig, "Endpoint is required when Transport is not set", nil)
@@ -107,24 +115,28 @@ func (c Config) BuildEngineWithTransport() (Engine, error) {
 		if c.Provider.DefaultModel == "" {
 			return nil, NewLLMError(ErrCodeInvalidConfig, "DefaultModel is required", nil)
 		}
-		engine = NewOpenAIProtocol(c.Provider.Endpoint, c.Provider.APIKey, c.Provider.DefaultModel)
+		if capabilities != nil {
+			engine = NewOpenAIProtocolWithOptions(c.Provider.Endpoint, c.Provider.APIKey, OpenAIOptions{
+				DefaultModel: c.Provider.DefaultModel,
+				Capabilities: capabilities,
+			})
+		} else {
+			engine = NewOpenAIProtocol(c.Provider.Endpoint, c.Provider.APIKey, c.Provider.DefaultModel)
+		}
 	}
 
-	return c.applyMiddleware(engine), nil
+	return c.applyMiddleware(engine, capabilities == nil), nil
 }
 
 // applyMiddleware 统一应用 Logger 和 Retry 中间件
-func (c Config) applyMiddleware(engine Engine) Engine {
+func (c Config) applyMiddleware(engine Engine, includeCapabilities bool) Engine {
 	retry := c.Retry
 	var capabilities *CapabilityNegotiationOptions
-	if c.Capabilities != nil {
-		clone := *c.Capabilities
-		if clone.DefaultModel == "" {
-			clone.DefaultModel = c.Provider.DefaultModel
-		}
-		capabilities = &clone
+	if includeCapabilities {
+		capabilities = c.resolvedCapabilities()
 	}
 	return ApplyStandardMiddleware(engine, StandardMiddlewareOptions{
+		DefaultModel:       c.Provider.DefaultModel,
 		Capabilities:       capabilities,
 		Observers:          c.Observers,
 		Logger:             c.Logger,
@@ -134,6 +146,17 @@ func (c Config) applyMiddleware(engine Engine) Engine {
 		RequestIDGenerator: c.RequestIDGenerator,
 		RateLimit:          c.RateLimit,
 	})
+}
+
+func (c Config) resolvedCapabilities() *CapabilityNegotiationOptions {
+	if c.Capabilities == nil {
+		return nil
+	}
+	clone := *c.Capabilities
+	if clone.DefaultModel == "" {
+		clone.DefaultModel = c.Provider.DefaultModel
+	}
+	return &clone
 }
 
 // ProviderConfig 提供商配置
