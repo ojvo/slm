@@ -14,7 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"slm"
+	"ojv/sto/copilot"
+	"ojv/sto/copilot/slmbridge"
+	"ojv/sto/slm"
 )
 
 var defaultAPIKey = ""
@@ -41,7 +43,9 @@ func main() {
 		"    middleware     Retry + RateLimit chain\n"+
 		"    error_handling Error codes and recovery\n"+
 		"    config         Builder pattern configuration\n"+
-		"    custom_http    Custom HTTP client settings\n\n"+
+		"    custom_http    Custom HTTP client settings\n"+
+		"    capabilities   Explicit model capability negotiation\n"+
+		"    observability  Official metrics/trace observer adapters\n\n"+
 		"  04-PATTERNS (设计模式)\n"+
 		"    conversation  Multi-turn context management\n"+
 		"    batch          Concurrent requests with isolation\n"+
@@ -96,6 +100,10 @@ func main() {
 		runConfig()
 	case "custom_http":
 		runCustomHTTP()
+	case "capabilities":
+		runCapabilities(ctx, engine)
+	case "observability":
+		runObservability(ctx, engine)
 
 	case "conversation":
 		runConversation(ctx, engine)
@@ -145,6 +153,8 @@ func runAll(ctx context.Context, engine slm.Engine) {
 		{"error_handling", func() { runErrorHandling(ctx, engine) }},
 		{"config", func() { runConfig() }},
 		{"custom_http", func() { runCustomHTTP() }},
+		{"capabilities", func() { runCapabilities(ctx, engine) }},
+		{"observability", func() { runObservability(ctx, engine) }},
 		{"conversation", func() { runConversation(ctx, engine) }},
 		{"batch", func() { runBatch(ctx, engine) }},
 		{"cancel", func() { runCancel(ctx, engine) }},
@@ -182,7 +192,7 @@ func runAll(ctx context.Context, engine slm.Engine) {
 func runBasic(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  BASIC: Simple Chat")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	req := &slm.Request{
 		Model: "gpt-4o-mini",
@@ -211,7 +221,7 @@ func runBasic(ctx context.Context, engine slm.Engine) {
 func runParameters(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  PARAMETERS: Temperature & MaxTokens")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	prompt := "Describe the color blue in one word."
 
@@ -223,7 +233,7 @@ func runParameters(ctx context.Context, engine slm.Engine) {
 		{
 			name: "Low temperature (creative)",
 			req: &slm.Request{
-				Temperature: 0.9,
+				Temperature: slm.Float64(0.9),
 				MaxTokens:   20,
 				Messages: []slm.Message{
 					slm.NewTextMessage(slm.RoleUser, prompt),
@@ -234,7 +244,7 @@ func runParameters(ctx context.Context, engine slm.Engine) {
 		{
 			name: "Zero temperature (deterministic)",
 			req: &slm.Request{
-				Temperature: 0.0,
+				Temperature: slm.Float64(0.0),
 				MaxTokens:   20,
 				Messages: []slm.Message{
 					slm.NewTextMessage(slm.RoleUser, prompt),
@@ -272,7 +282,7 @@ func runParameters(ctx context.Context, engine slm.Engine) {
 func runJSONMode(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  JSON MODE: Structured Output")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	type Sentiment struct {
 		Text      string   `json:"text"`
@@ -308,7 +318,7 @@ func runJSONMode(ctx context.Context, engine slm.Engine) {
 func runStreaming(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  STREAMING: Real-time Output")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	req := &slm.Request{
 		Model: "gpt-4o-mini",
@@ -347,7 +357,7 @@ func runStreaming(ctx context.Context, engine slm.Engine) {
 func runToolCalling(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  TOOL CALLING: Multi-tool Execution")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	tools := []slm.Tool{
 		{
@@ -440,7 +450,7 @@ func runToolCalling(ctx context.Context, engine slm.Engine) {
 func runGeneric(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  GENERIC: Type-safe Call[T]")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	type Issue struct {
 		File     string `json:"file"`
@@ -493,7 +503,7 @@ func runGeneric(ctx context.Context, engine slm.Engine) {
 func runReasoning(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  REASONING: o1/o3 Chain-of-Thought")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	req := &slm.Request{
 		Model: "gpt-4o-mini",
@@ -528,7 +538,7 @@ Show your reasoning step by step.`),
 func runMiddleware(engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  MIDDLEWARE: Retry + RateLimit Chain")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	retryUnary, retryStream := slm.RetryMiddlewareWithConfig(slm.RetryConfig{
 		MaxAttempts: 3,
@@ -546,7 +556,7 @@ func runMiddleware(engine slm.Engine) {
 		[]slm.StreamMiddleware{rateLimitStream, retryStream},
 	)
 
-	fmt.Println("Chain: Request → [RateLimit(5 QPS)] → [Retry(3x)] → Engine\n")
+	fmt.Println("Chain: Request → [RateLimit(5 QPS)] → [Retry(3x)] → Engine")
 
 	ctx := context.Background()
 	prompts := []string{
@@ -593,7 +603,7 @@ func runMiddleware(engine slm.Engine) {
 func runErrorHandling(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  ERROR HANDLING: Code Classification")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	scenarios := []struct {
 		name string
@@ -657,18 +667,20 @@ func runErrorHandling(ctx context.Context, engine slm.Engine) {
 
 func codeName(c slm.ErrorCode) string {
 	names := map[slm.ErrorCode]string{
-		slm.ErrCodeRateLimit:      "Rate Limit",
-		slm.ErrCodeTimeout:        "Timeout",
-		slm.ErrCodeOverloaded:     "Overloaded",
-		slm.ErrCodeNetwork:        "Network",
-		slm.ErrCodeAuth:           "Auth Failed",
-		slm.ErrCodeInvalidModel:   "Invalid Model",
-		slm.ErrCodeInvalidConfig:  "Bad Config",
-		slm.ErrCodeContentFilter:  "Content Filtered",
-		slm.ErrCodeContextTooLong: "Context Too Long",
-		slm.ErrCodeParse:          "Parse Error",
-		slm.ErrCodeInternal:       "Internal Error",
-		slm.ErrCodeCancelled:      "Cancelled",
+		slm.ErrCodeRateLimit:             "Rate Limit",
+		slm.ErrCodeTimeout:               "Timeout",
+		slm.ErrCodeOverloaded:            "Overloaded",
+		slm.ErrCodeNetwork:               "Network",
+		slm.ErrCodeServer:                "Server Error",
+		slm.ErrCodeAuth:                  "Auth Failed",
+		slm.ErrCodeInvalidModel:          "Invalid Model",
+		slm.ErrCodeInvalidConfig:         "Bad Config",
+		slm.ErrCodeUnsupportedCapability: "Unsupported Capability",
+		slm.ErrCodeContentFilter:         "Content Filtered",
+		slm.ErrCodeContextTooLong:        "Context Too Long",
+		slm.ErrCodeParse:                 "Parse Error",
+		slm.ErrCodeInternal:              "Internal Error",
+		slm.ErrCodeCancelled:             "Cancelled",
 	}
 	if n, ok := names[c]; ok {
 		return n
@@ -679,7 +691,7 @@ func codeName(c slm.ErrorCode) string {
 func runConfig() {
 	fmt.Println("========================================")
 	fmt.Println("  CONFIG: Builder Pattern")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	cfg := slm.DefaultConfig().
 		WithProvider(slm.ProviderConfig{
@@ -708,7 +720,7 @@ func runConfig() {
 func runCustomHTTP() {
 	fmt.Println("========================================")
 	fmt.Println("  CUSTOM HTTP: Transport Settings")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	client := &http.Client{
 		Timeout: 45 * time.Second,
@@ -725,15 +737,11 @@ func runCustomHTTP() {
 		},
 	}
 
-	engine := slm.NewOpenAIProtocol(
+	transport := slm.NewHTTPTransportWithClient(client,
 		"https://models.inference.ai.azure.com",
 		getAPIKey(),
-		"gpt-4o-mini",
 	)
-
-	if e, ok := engine.(*slm.OpenAIEngine); ok {
-		e.Client = client
-	}
+	engine := slm.NewOpenAIWithTransport(transport, "gpt-4o-mini")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -761,6 +769,242 @@ func runCustomHTTP() {
 	fmt.Printf("   - KeepAlive: 30s\n")
 }
 
+func runCapabilities(ctx context.Context, engine slm.Engine) {
+	fmt.Println("========================================")
+	fmt.Println("  CAPABILITIES: Explicit Negotiation")
+	fmt.Println("========================================")
+
+	resolver := slm.ChainCapabilityResolvers(
+		slmbridge.StaticResolver([]copilot.Model{
+			{
+				ID: "gpt-4o-mini",
+				Capabilities: copilot.ModelCapabilities{
+					Supports: copilot.ModelSupports{
+						StructuredOutputs: true,
+						ToolCalls:         true,
+						Vision:            true,
+						AdaptiveThinking:  true,
+						ReasoningEffort:   []string{"low", "medium", "high"},
+					},
+				},
+			},
+		}),
+		slm.StaticCapabilityResolver{
+			"*": {Supports: slm.CapabilitySet{JSONMode: true}},
+		},
+	)
+
+	fmt.Println("Resolver chain:")
+	fmt.Println("  1. Copilot model catalog bridge -> slm.CapabilityResolver")
+	fmt.Println("  2. Generic slm fallback for unknown models")
+
+	wrapped := slm.ApplyStandardMiddleware(engine, slm.StandardMiddlewareOptions{
+		Capabilities: &slm.CapabilityNegotiationOptions{
+			Resolver:     resolver,
+			DefaultModel: "gpt-4o-mini",
+			RequireKnown: true,
+		},
+		Observers: []slm.LifecycleObserver{capabilityPrinterObserver{}},
+	})
+
+	fmt.Println("--- Preflight reject before provider call ---")
+	_, err := wrapped.Generate(ctx, &slm.Request{
+		Model: "json-only-model",
+		Tools: []slm.Tool{{
+			Name:        "lookup",
+			Description: "lookup a record",
+			Parameters:  map[string]any{"type": "object"},
+		}},
+		Messages: []slm.Message{slm.NewTextMessage(slm.RoleUser, "use the tool")},
+	})
+	if err != nil {
+		fmt.Printf("Rejected: %v\n", err)
+	}
+
+	fmt.Println("\n--- Allowed request with explicit reasoning + JSON mode ---")
+	resp, err := wrapped.Generate(ctx, &slm.Request{
+		JSONMode:  true,
+		Reasoning: &slm.ReasoningOptions{Effort: "medium"},
+		Messages: []slm.Message{
+			slm.NewTextMessage(slm.RoleSystem, "Return compact JSON only."),
+			slm.NewTextMessage(slm.RoleUser, `Summarize Go interfaces in JSON with fields summary and use_case.`),
+		},
+	})
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Response: %s\n", resp.Content)
+	fmt.Println("✓ Request was preflight-validated against explicit model capabilities")
+}
+
+func runObservability(ctx context.Context, engine slm.Engine) {
+	fmt.Println("========================================")
+	fmt.Println("  OBSERVABILITY: Metrics + Trace Adapters")
+	fmt.Println("========================================")
+
+	now := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
+	refreshes := 0
+	resolver := slm.NewCatalogCapabilityResolver(func(context.Context) ([]slm.ModelCapabilities, error) {
+		refreshes++
+		if refreshes == 1 {
+			return []slm.ModelCapabilities{{
+				Model:    "gpt-4o-mini",
+				Supports: slm.CapabilitySet{JSONMode: true, ToolCalls: true, Vision: true, Reasoning: true},
+			}}, nil
+		}
+		return nil, fmt.Errorf("demo catalog refresh failed")
+	}, slm.CapabilityCatalogResolverOptions{
+		CacheTTL:          time.Minute,
+		Now:               func() time.Time { return now },
+		AllowStaleOnError: true,
+	})
+	if _, _, err := resolver.ResolveCapabilities(ctx, "gpt-4o-mini"); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	now = now.Add(2 * time.Minute)
+
+	meter := &exampleMeter{}
+	tracer := &exampleTracer{}
+	wrapped := slm.ApplyStandardMiddleware(engine, slm.StandardMiddlewareOptions{
+		EnableRequestID:    true,
+		RequestIDGenerator: func() string { return "demo_observe_req" },
+		Capabilities: &slm.CapabilityNegotiationOptions{
+			Resolver:     resolver,
+			DefaultModel: "gpt-4o-mini",
+		},
+		Observers: []slm.LifecycleObserver{
+			slm.NewMetricsObserver(meter, slm.MetricsObserverOptions{Namespace: "demo"}),
+			slm.NewTraceObserver(tracer, slm.TraceObserverOptions{SpanPrefix: "demo"}),
+		},
+	})
+
+	resp, err := wrapped.Generate(ctx, &slm.Request{
+		Model:    "gpt-4o-mini",
+		JSONMode: true,
+		Messages: []slm.Message{slm.NewTextMessage(slm.RoleUser, "Return valid JSON: {\"status\":\"ok\"}")},
+	})
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Response: %s\n", resp.Content)
+	fmt.Println("Simulated capability catalog: refresh expired, reload failed, stale fallback remained available")
+	fmt.Println("\nMetrics:")
+	for _, line := range meter.lines {
+		fmt.Printf("  %s\n", line)
+	}
+	fmt.Println("  note: capability negotiation attributes now show capabilities.source=catalog, capabilities.known=true, and capabilities.stale=true")
+	fmt.Println("\nSpans:")
+	for _, line := range tracer.lines {
+		fmt.Printf("  %s\n", line)
+	}
+}
+
+type capabilityPrinterObserver struct{}
+
+func (capabilityPrinterObserver) OnRequestStart(_ context.Context, event slm.LifecycleEvent) {
+	if negotiated, ok := slm.GetNegotiatedCapabilities(event.Context); ok {
+		refreshedAt := ""
+		if !negotiated.State.RefreshedAt.IsZero() {
+			refreshedAt = negotiated.State.RefreshedAt.Format(time.RFC3339)
+		}
+		fmt.Printf("Negotiated model=%s requested=%+v supported=%+v known=%v source=%s refreshed_at=%s stale=%v\n", negotiated.Model, negotiated.Requested, negotiated.Supported, negotiated.Known, negotiated.State.Source, refreshedAt, negotiated.Stale)
+	}
+}
+
+func (capabilityPrinterObserver) OnRequestFinish(context.Context, slm.LifecycleEvent)   {}
+func (capabilityPrinterObserver) OnStreamStart(context.Context, slm.LifecycleEvent)     {}
+func (capabilityPrinterObserver) OnStreamConnected(context.Context, slm.LifecycleEvent) {}
+func (capabilityPrinterObserver) OnStreamFinish(context.Context, slm.LifecycleEvent)    {}
+
+type exampleMeter struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+type exampleCounter struct {
+	meter *exampleMeter
+	name  string
+}
+
+type exampleHistogram struct {
+	meter *exampleMeter
+	name  string
+}
+
+func (m *exampleMeter) Int64Counter(name, description, unit string) slm.Int64Counter {
+	return &exampleCounter{meter: m, name: name}
+}
+
+func (m *exampleMeter) Float64Histogram(name, description, unit string) slm.Float64Histogram {
+	return &exampleHistogram{meter: m, name: name}
+}
+
+func (c *exampleCounter) Add(_ context.Context, value int64, attrs ...slm.Attribute) {
+	c.meter.record(fmt.Sprintf("counter %s += %d %s", c.name, value, formatAttributes(attrs)))
+}
+
+func (h *exampleHistogram) Record(_ context.Context, value float64, attrs ...slm.Attribute) {
+	h.meter.record(fmt.Sprintf("histogram %s = %.3f %s", h.name, value, formatAttributes(attrs)))
+}
+
+func (m *exampleMeter) record(line string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lines = append(m.lines, line)
+}
+
+type exampleTracer struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+type exampleSpan struct {
+	tracer *exampleTracer
+	name   string
+	attrs  []slm.Attribute
+	errors []error
+}
+
+func (t *exampleTracer) Start(ctx context.Context, name string, attrs ...slm.Attribute) (context.Context, slm.Span) {
+	return ctx, &exampleSpan{tracer: t, name: name, attrs: append([]slm.Attribute(nil), attrs...)}
+}
+
+func (s *exampleSpan) SetAttributes(attrs ...slm.Attribute) {
+	s.attrs = append(s.attrs, attrs...)
+}
+
+func (s *exampleSpan) RecordError(err error) {
+	if err != nil {
+		s.errors = append(s.errors, err)
+	}
+}
+
+func (s *exampleSpan) End() {
+	line := fmt.Sprintf("span %s attrs=%s", s.name, formatAttributes(s.attrs))
+	if len(s.errors) > 0 {
+		line += fmt.Sprintf(" errors=%d", len(s.errors))
+	}
+	s.tracer.mu.Lock()
+	defer s.tracer.mu.Unlock()
+	s.tracer.lines = append(s.tracer.lines, line)
+}
+
+func formatAttributes(attrs []slm.Attribute) string {
+	if len(attrs) == 0 {
+		return "{}"
+	}
+	parts := make([]string, 0, len(attrs))
+	for _, attr := range attrs {
+		parts = append(parts, fmt.Sprintf("%s=%v", attr.Key, attr.Value))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
 // ============================================================
 // 04-PATTERNS: 设计模式示例
 // ============================================================
@@ -768,7 +1012,7 @@ func runCustomHTTP() {
 func runConversation(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  CONVERSATION: Multi-turn Context")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	history := []slm.Message{
 		slm.NewTextMessage(slm.RoleSystem, `You are a helpful coding tutor.
@@ -809,7 +1053,7 @@ Keep responses under 100 words.`),
 func runBatch(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  BATCH: Concurrent Requests")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	tasks := []struct {
 		ID     string
@@ -883,7 +1127,7 @@ type BatchResult struct {
 func runCancel(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  CANCEL: Timeout & Cancellation")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	longReq := &slm.Request{
 		Model: "gpt-4o-mini",
@@ -939,7 +1183,7 @@ func runCancel(ctx context.Context, engine slm.Engine) {
 func runAccumulator(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  ACCUMULATOR: Buffered Stream Collection")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	iter, err := engine.Stream(ctx, &slm.Request{
 		Model: "gpt-4o-mini",
@@ -997,7 +1241,7 @@ func runAccumulator(ctx context.Context, engine slm.Engine) {
 func runMultimodal(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  MULTIMODAL: Vision (Image + Text)")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	imgURL := []string{
 		"https://raw.githubusercontent.com/microsoft/vscode/main/resources/win32/code_70x70.png",
@@ -1033,7 +1277,7 @@ func runMultimodal(ctx context.Context, engine slm.Engine) {
 func runFewShot(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  FEW-SHOT: Learning from Examples")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	type Translation struct {
 		Input  string `json:"input"`
@@ -1052,7 +1296,7 @@ Now translate:`
 
 	result, err := slm.Call[Translation](ctx, engine, &slm.Request{
 		Model:       "gpt-4o-mini",
-		Temperature: 0.0,
+		Temperature: slm.Float64(0.0),
 		Messages: []slm.Message{
 			slm.NewTextMessage(slm.RoleSystem, systemPrompt),
 			slm.NewTextMessage(slm.RoleUser, userPrompt),
@@ -1074,7 +1318,7 @@ Now translate:`
 func runSimpleCall(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  SIMPLE CALL: Convenience Wrappers")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	fmt.Println("--- SimpleCall: One-liner text query ---")
 	answer, err := slm.SimpleCall(ctx, engine, "What is the capital of Japan? Reply with just the city name.")
@@ -1113,7 +1357,7 @@ func runSimpleCall(ctx context.Context, engine slm.Engine) {
 func runFullText(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  FULL TEXT: Reasoning Content Extraction")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	req := &slm.Request{
 		Model: "gpt-4o-mini",
@@ -1209,7 +1453,7 @@ func (l *MyLogger) Error(msg string, args ...any) {
 func runLogging(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  LOGGING: Logger Interface + Middleware")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	logger := &MyLogger{prefix: "LLM"}
 
@@ -1217,7 +1461,7 @@ func runLogging(ctx context.Context, engine slm.Engine) {
 
 	wrapped := slm.Chain(engine, loggingMW)
 
-	fmt.Println("--- Request with automatic logging ---\n")
+	fmt.Println("--- Request with automatic logging ---")
 
 	resp, err := wrapped.Generate(ctx, &slm.Request{
 		Model: "gpt-4o-mini",
@@ -1241,7 +1485,7 @@ func runLogging(ctx context.Context, engine slm.Engine) {
 func runTimeout(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  TIMEOUT: Request Timeout Control")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	timeoutMW := slm.TimeoutMiddleware(5 * time.Second)
 
@@ -1302,7 +1546,7 @@ func runTimeout(ctx context.Context, engine slm.Engine) {
 func runRequestID(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")
 	fmt.Println("  REQUEST ID: Distributed Tracing")
-	fmt.Println("========================================\n")
+	fmt.Println("========================================")
 
 	requestIDMW := slm.RequestIDMiddleware(nil)
 

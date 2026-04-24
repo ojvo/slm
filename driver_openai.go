@@ -1,38 +1,49 @@
 package slm
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 )
 
-// OpenAIEngine OpenAI 协议驱动
+// OpenAIEngine OpenAI 协议驱动。
+// 只负责 OpenAI 协议的编解码，HTTP 通信和认证由 Transport 实现。
 type OpenAIEngine struct {
-	BaseEngine
+	transport    Transport
+	defaultModel string
 }
 
-// NewOpenAIProtocol 创建 OpenAI 协议引擎
+// NewOpenAIProtocol 创建 OpenAI 协议引擎（使用标准 HTTP 传输）。
 func NewOpenAIProtocol(baseURL, apiKey, defaultModel string) Engine {
-	baseURL = strings.TrimRight(baseURL, "/")
 	return &OpenAIEngine{
-		BaseEngine: BaseEngine{
-			Client: &http.Client{
-				Timeout: 120 * time.Second,
-			},
-			BaseURL:      baseURL,
-			APIKey:       apiKey,
-			AuthHeader:   "Authorization",
-			AuthPrefix:   "Bearer ",
-			DefaultModel: defaultModel,
-			ExtraHeader:  make(map[string]string),
-		},
+		transport:    NewHTTPTransport(baseURL, apiKey),
+		defaultModel: defaultModel,
 	}
 }
+
+// NewOpenAIWithTransport 创建使用自定义 Transport 的 OpenAI 协议引擎。
+// 这使得 OpenAIEngine 可以搭配不同的传输层，例如 CopilotTransport。
+//
+// 使用示例：
+//
+//	// HTTP 直连
+//	engine := slm.NewOpenAIWithTransport(slm.NewHTTPTransport(url, key), "gpt-4o")
+//
+//	// Copilot 传输
+//	client := copilot.NewClient()
+//	client.Auth(ctx)
+//	engine := slm.NewOpenAIWithTransport(copilot.NewTransport(client), "gpt-4o")
+func NewOpenAIWithTransport(transport Transport, defaultModel string) Engine {
+	return &OpenAIEngine{
+		transport:    transport,
+		defaultModel: defaultModel,
+	}
+}
+
+const maxResponseSize = 50 * 1024 * 1024 // 50MB
 
 // Generate 生成完整响应
 func (e *OpenAIEngine) Generate(ctx context.Context, req *Request) (*Response, error) {
@@ -48,7 +59,7 @@ func (e *OpenAIEngine) Generate(ctx context.Context, req *Request) (*Response, e
 	}
 
 	var oaiResp oaiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&oaiResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseSize)).Decode(&oaiResp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
@@ -76,110 +87,73 @@ func (e *OpenAIEngine) doRequest(ctx context.Context, req *Request, stream bool)
 		return nil, NewLLMError(ErrCodeInvalidConfig, "request is nil", nil)
 	}
 
+	if len(req.Messages) == 0 {
+		return nil, NewLLMError(ErrCodeInvalidConfig, "messages is required", nil)
+	}
+
 	model := e.resolveModel(req.Model)
 	if model == "" {
 		return nil, NewLLMError(ErrCodeInvalidModel, "model is required", nil)
 	}
 
-	oaiReq := e.buildRequest(req, model, stream)
-
-	body, err := e.marshalRequest(oaiReq, req.ExtraBody)
+	body, err := e.buildRequestBody(req, model, stream)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, e.BaseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+	headers := map[string]string{}
+	if stream {
+		headers["Accept"] = "text/event-stream"
 	}
 
-	e.setHeaders(httpReq)
-
-	resp, err := e.Client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	return resp, nil
+	return e.transport.Do(ctx, http.MethodPost, "/chat/completions", headers, body)
 }
 
 func (e *OpenAIEngine) resolveModel(model string) string {
 	if model != "" {
 		return model
 	}
-	return e.DefaultModel
+	return e.defaultModel
 }
 
-func (e *OpenAIEngine) setHeaders(req *http.Request) {
-	req.Header.Set("Content-Type", "application/json")
-	if e.APIKey != "" {
-		req.Header.Set(e.AuthHeader, e.AuthPrefix+e.APIKey)
-	}
-	for k, v := range e.ExtraHeader {
-		req.Header.Set(k, v)
-	}
-}
-
-func (e *OpenAIEngine) buildRequest(req *Request, model string, stream bool) oaiRequest {
-	messages := convertMessages(req.Messages)
-
-	oaiReq := oaiRequest{
-		Model:            model,
-		Messages:         messages,
-		Temperature:      req.Temperature,
-		TopP:             req.TopP,
-		MaxTokens:        req.MaxTokens,
-		Stop:             req.Stop,
-		PresencePenalty:  req.PresencePenalty,
-		FrequencyPenalty: req.FrequencyPenalty,
-		Stream:           stream,
-	}
-
-	if stream {
-		oaiReq.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
-	}
-
-	if req.JSONMode {
-		oaiReq.ResponseFormat = &struct {
-			Type string `json:"type"`
-		}{Type: "json_object"}
-	}
-
-	if len(req.Tools) > 0 {
-		oaiReq.Tools = convertTools(req.Tools)
-	}
-
-	return oaiReq
-}
-
-func (e *OpenAIEngine) marshalRequest(oaiReq oaiRequest, extraBody map[string]any) ([]byte, error) {
+func (e *OpenAIEngine) buildRequestBody(req *Request, model string, stream bool) ([]byte, error) {
 	reqMap := map[string]any{
-		"model":             oaiReq.Model,
-		"messages":          oaiReq.Messages,
-		"stream":            oaiReq.Stream,
-		"temperature":       oaiReq.Temperature,
-		"top_p":             oaiReq.TopP,
-		"presence_penalty":  oaiReq.PresencePenalty,
-		"frequency_penalty": oaiReq.FrequencyPenalty,
+		"model":    model,
+		"messages": convertMessages(req.Messages),
+		"stream":   stream,
 	}
 
-	if oaiReq.MaxTokens > 0 {
-		reqMap["max_tokens"] = oaiReq.MaxTokens
+	if req.Temperature != nil {
+		reqMap["temperature"] = *req.Temperature
 	}
-
-	if len(oaiReq.Stop) > 0 {
-		reqMap["stop"] = oaiReq.Stop
+	if req.TopP != nil {
+		reqMap["top_p"] = *req.TopP
 	}
-	if oaiReq.StreamOptions != nil {
-		reqMap["stream_options"] = oaiReq.StreamOptions
+	if req.PresencePenalty != nil {
+		reqMap["presence_penalty"] = *req.PresencePenalty
 	}
-	if oaiReq.ResponseFormat != nil {
-		reqMap["response_format"] = oaiReq.ResponseFormat
+	if req.FrequencyPenalty != nil {
+		reqMap["frequency_penalty"] = *req.FrequencyPenalty
 	}
-	if len(oaiReq.Tools) > 0 {
-		reqMap["tools"] = oaiReq.Tools
+	if req.MaxTokens > 0 {
+		reqMap["max_tokens"] = req.MaxTokens
 	}
-
-	for k, v := range extraBody {
+	if len(req.Stop) > 0 {
+		reqMap["stop"] = req.Stop
+	}
+	if stream {
+		reqMap["stream_options"] = map[string]any{"include_usage": true}
+	}
+	if req.JSONMode {
+		reqMap["response_format"] = map[string]any{"type": "json_object"}
+	}
+	if req.Reasoning != nil && req.Reasoning.Effort != "" {
+		reqMap["reasoning_effort"] = req.Reasoning.Effort
+	}
+	if len(req.Tools) > 0 {
+		reqMap["tools"] = convertTools(req.Tools)
+	}
+	for k, v := range req.ExtraBody {
 		reqMap[k] = v
 	}
 
@@ -193,7 +167,11 @@ func (e *OpenAIEngine) parseSSEChunk(event string, data []byte) (*Response, bool
 	}
 
 	if len(chunk.Choices) == 0 {
-		return &Response{}, false, nil
+		resp := &Response{}
+		if chunk.Usage != nil {
+			resp.Usage = *chunk.Usage
+		}
+		return resp, false, nil
 	}
 
 	choice := chunk.Choices[0]
@@ -210,6 +188,7 @@ func (e *OpenAIEngine) parseSSEChunk(event string, data []byte) (*Response, bool
 	if len(choice.Delta.ToolCalls) > 0 {
 		for _, tc := range choice.Delta.ToolCalls {
 			toolCalls = append(toolCalls, APIToolCall{
+				Index:     tc.Index,
 				ID:        tc.ID,
 				Type:      tc.Type,
 				Name:      tc.Function.Name,
@@ -242,12 +221,7 @@ func (e *OpenAIEngine) convertResponse(oaiResp *oaiResponse) *Response {
 	}
 
 	choice := oaiResp.Choices[0]
-	content := ""
-	if choice.Message.Content != nil {
-		if s, ok := choice.Message.Content.(string); ok {
-			content = s
-		}
-	}
+	content := extractResponseText(choice.Message.Content)
 
 	var toolCalls []APIToolCall
 	for _, tc := range choice.Message.ToolCalls {
@@ -278,28 +252,34 @@ func (e *OpenAIEngine) convertResponse(oaiResp *oaiResponse) *Response {
 	}
 }
 
-// 内部请求/响应类型
-type oaiRequest struct {
-	Model            string
-	Messages         []oaiMessage
-	Temperature      float64
-	TopP             float64
-	MaxTokens        int
-	Stop             []string
-	PresencePenalty  float64
-	FrequencyPenalty float64
-	Stream           bool
-	StreamOptions    *oaiStreamOptions
-	ResponseFormat   *struct {
-		Type string `json:"type"`
+func extractResponseText(content any) string {
+	switch value := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	case []any:
+		var builder strings.Builder
+		for _, item := range value {
+			part, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			partType, _ := part["type"].(string)
+			switch partType {
+			case "", "text", "output_text":
+				if text, ok := part["text"].(string); ok {
+					builder.WriteString(text)
+				}
+			}
+		}
+		return builder.String()
+	default:
+		return ""
 	}
-	Tools []oaiTool
 }
 
-type oaiStreamOptions struct {
-	IncludeUsage bool `json:"include_usage"`
-}
-
+// 内部请求/响应类型
 type oaiTool struct {
 	Type     string      `json:"type"`
 	Function oaiFunction `json:"function"`
@@ -313,10 +293,20 @@ type oaiFunction struct {
 
 type oaiMessage struct {
 	Role             string        `json:"role"`
+	Name             string        `json:"name,omitempty"`
 	Content          any           `json:"content"`
 	ReasoningContent string        `json:"reasoning_content,omitempty"`
 	ToolCalls        []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string        `json:"tool_call_id,omitempty"`
+}
+
+func (m oaiMessage) MarshalJSON() ([]byte, error) {
+	type alias oaiMessage
+	a := alias(m)
+	if a.Content == nil && len(a.ToolCalls) == 0 {
+		a.Content = ""
+	}
+	return json.Marshal(a)
 }
 
 type oaiToolCall struct {
@@ -383,25 +373,27 @@ func buildImageContent(p ImagePart) map[string]any {
 		return nil
 	}
 	img := map[string]any{"type": "image_url"}
+	imageURL := map[string]any{}
 	if p.URL != "" {
-		img["image_url"] = map[string]any{"url": p.URL}
+		imageURL["url"] = p.URL
 	} else {
 		mime := p.MIME
 		if mime == "" {
 			mime = "image/png"
 		}
-		img["image_url"] = map[string]any{"url": "data:" + mime + ";base64," + p.Base64}
+		imageURL["url"] = "data:" + mime + ";base64," + p.Base64
 	}
 	if p.Detail != "" {
-		img["detail"] = p.Detail
+		imageURL["detail"] = p.Detail
 	}
+	img["image_url"] = imageURL
 	return img
 }
 
 func convertMessages(messages []Message) []oaiMessage {
 	result := make([]oaiMessage, len(messages))
 	for i, msg := range messages {
-		oaiMsg := oaiMessage{Role: string(msg.Role), ToolCallID: msg.ToolCallID}
+		oaiMsg := oaiMessage{Role: string(msg.Role), Name: msg.Name, ToolCallID: msg.ToolCallID}
 
 		switch len(msg.Content) {
 		case 0:
@@ -469,6 +461,7 @@ func convertTools(tools []Tool) []oaiTool {
 
 // APIToolCall API 工具调用结构
 type APIToolCall struct {
+	Index     int    `json:"index,omitempty"`
 	ID        string `json:"id"`
 	Type      string `json:"type"`
 	Name      string `json:"name"`
@@ -483,11 +476,13 @@ type Tool struct {
 }
 
 func classifyHTTPError(statusCode int, body []byte) ErrorCode {
-	bodyStr := string(body)
+	bodyStr := strings.ToLower(string(body))
 
 	switch statusCode {
 	case 401, 403:
 		return ErrCodeAuth
+	case 408:
+		return ErrCodeTimeout
 	case 429:
 		return ErrCodeRateLimit
 	case 503:
@@ -503,9 +498,11 @@ func classifyHTTPError(statusCode int, body []byte) ErrorCode {
 			return ErrCodeInvalidModel
 		}
 		return ErrCodeInvalidConfig
+	case 404:
+		return ErrCodeInvalidConfig
 	default:
 		if statusCode >= 500 {
-			return ErrCodeNetwork
+			return ErrCodeServer
 		}
 		return ErrCodeInternal
 	}

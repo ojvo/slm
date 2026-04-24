@@ -3,8 +3,12 @@ package slm
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
+	"sync"
 )
+
+const maxDataBufferSize = 10 * 1024 * 1024 // 10MB
 
 // StreamParser is a function that parses a single SSE data line into a Response
 type StreamParser func(event string, data []byte) (*Response, bool, error)
@@ -16,10 +20,12 @@ type SSEReader struct {
 	current      *Response
 	rawLine      []byte
 	closer       io.Closer
+	closeOnce    sync.Once
 	usage        *Usage
 	err          error
 	currentEvent string
 	dataBuffer   bytes.Buffer
+	done         bool
 }
 
 // NewSSEReader creates a new SSEReader
@@ -36,18 +42,31 @@ func (r *SSEReader) Next() bool {
 	if r.err != nil {
 		return false
 	}
+	if r.done {
+		return false
+	}
 
 	for {
 		line, err := r.reader.ReadBytes('\n')
 		if err != nil {
 			if err == io.EOF {
-				if r.dataBuffer.Len() > 0 {
-					yield, stop := r.dispatch()
-					if stop {
-						return false
+				if len(line) > 0 {
+					line = bytes.TrimSuffix(line, []byte("\n"))
+					line = bytes.TrimSuffix(line, []byte("\r"))
+					if r.processLine(line) {
+						break
 					}
-					return yield
 				}
+				if r.err != nil {
+					return false
+				}
+				if r.dataBuffer.Len() > 0 {
+					yield, _ := r.dispatch()
+					if yield {
+						return true
+					}
+				}
+				r.done = true
 				r.Close()
 				return false
 			}
@@ -62,7 +81,7 @@ func (r *SSEReader) Next() bool {
 			if r.dataBuffer.Len() > 0 {
 				yield, stop := r.dispatch()
 				if stop {
-					return false
+					return yield
 				}
 				if yield {
 					return true
@@ -73,25 +92,48 @@ func (r *SSEReader) Next() bool {
 			continue
 		}
 
-		if bytes.HasPrefix(line, []byte("event:")) {
-			r.currentEvent = string(bytes.TrimSpace(line[6:]))
-			continue
+		if r.processLine(line) {
+			break
 		}
-
-		if bytes.HasPrefix(line, []byte("data:")) {
-			data := bytes.TrimSpace(line[5:])
-			if string(data) == "[DONE]" {
-				if r.dataBuffer.Len() > 0 {
-					yield, _ := r.dispatch()
-					return yield
-				}
-				r.Close()
-				return false
-			}
-			r.dataBuffer.Write(data)
-			continue
+		if r.err != nil {
+			return false
 		}
 	}
+
+	if r.dataBuffer.Len() > 0 {
+		yield, _ := r.dispatch()
+		if yield {
+			return true
+		}
+	}
+	r.done = true
+	r.Close()
+	return false
+}
+
+func (r *SSEReader) processLine(line []byte) bool {
+	if bytes.HasPrefix(line, []byte("event:")) {
+		r.currentEvent = string(bytes.TrimSpace(line[6:]))
+		return false
+	}
+
+	if bytes.HasPrefix(line, []byte("data:")) {
+		data := bytes.TrimSpace(line[5:])
+		if string(data) == "[DONE]" {
+			return true
+		}
+		if r.dataBuffer.Len()+len(data) > maxDataBufferSize {
+			r.err = fmt.Errorf("SSE data buffer exceeded %d bytes", maxDataBufferSize)
+			return false
+		}
+		if r.dataBuffer.Len() > 0 {
+			r.dataBuffer.WriteByte('\n')
+		}
+		r.dataBuffer.Write(data)
+		return false
+	}
+
+	return false
 }
 
 // Chunk returns the current raw line.
@@ -121,14 +163,25 @@ func (r *SSEReader) Err() error { return r.err }
 
 // Close closes the reader and releases resources.
 func (r *SSEReader) Close() error {
-	if r.closer != nil {
-		return r.closer.Close()
-	}
-	return nil
+	var err error
+	r.closeOnce.Do(func() {
+		if r.closer != nil {
+			err = r.closer.Close()
+		}
+	})
+	return err
+}
+
+// Interrupt attempts to stop the stream promptly.
+func (r *SSEReader) Interrupt(error) {
+	_ = r.Close()
 }
 
 // Usage returns token usage after stream ends.
 func (r *SSEReader) Usage() *Usage { return r.usage }
+
+// Response returns the current parsed response chunk.
+func (r *SSEReader) Response() *Response { return r.current }
 
 func (r *SSEReader) dispatch() (bool, bool) {
 	data := r.dataBuffer.Bytes()
@@ -141,11 +194,20 @@ func (r *SSEReader) dispatch() (bool, bool) {
 	}
 
 	r.current = resp
-	r.rawLine = data
+	r.rawLine = make([]byte, len(data))
+	copy(r.rawLine, data)
 
-	if done && resp != nil && resp.Usage.PromptTokens > 0 {
+	if resp != nil && hasUsage(resp.Usage) {
 		r.usage = &resp.Usage
 	}
 
+	if resp != nil && resp.Content == "" && resp.ReasoningContent == "" && len(resp.ToolCalls) == 0 && resp.FinishReason == "" {
+		return false, done
+	}
+
 	return true, done
+}
+
+func hasUsage(usage Usage) bool {
+	return usage.PromptTokens > 0 || usage.CompletionTokens > 0 || usage.TotalTokens > 0
 }

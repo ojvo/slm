@@ -81,18 +81,26 @@ func NewImageMessage(imageURL string) Message {
 	}
 }
 
+// Float64 returns a pointer to the given float64 value.
+// Use this to set optional Request fields like Temperature:
+//
+//	req.Temperature = slm.Float64(0.0)  // explicitly set to 0
+//	req.TopP = slm.Float64(0.9)
+func Float64(v float64) *float64 { return &v }
+
 // Request 统一请求结构
 type Request struct {
 	Model            string
 	Messages         []Message
-	Temperature      float64
-	TopP             float64
+	Temperature      *float64
+	TopP             *float64
 	MaxTokens        int
 	Stop             []string
-	PresencePenalty  float64
-	FrequencyPenalty float64
+	PresencePenalty  *float64
+	FrequencyPenalty *float64
 	Stream           bool
 	JSONMode         bool
+	Reasoning        *ReasoningOptions
 	Tools            []Tool
 	Meta             map[string]any
 	ExtraBody        map[string]any
@@ -115,15 +123,13 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// BaseEngine 包含所有 Driver 共有的字段
-type BaseEngine struct {
-	Client       *http.Client
-	BaseURL      string
-	APIKey       string
-	AuthHeader   string
-	AuthPrefix   string
-	DefaultModel string
-	ExtraHeader  map[string]string
+// Transport 抽象 LLM API 的 HTTP 通信层。
+// OpenAIEngine 只负责 OpenAI 协议的编解码，实际的 HTTP 通信和认证
+// 由 Transport 实现。这使得同一个协议引擎可以搭配不同的传输方式：
+//   - HTTPTransport: 标准 Bearer token + HTTP 直连
+//   - CopilotTransport: GitHub OAuth + token 自动刷新
+type Transport interface {
+	Do(ctx context.Context, method, path string, headers map[string]string, body []byte) (*http.Response, error)
 }
 
 // StreamIterator 流式迭代器接口
@@ -135,6 +141,18 @@ type StreamIterator interface {
 	Err() error
 	Close() error
 	Usage() *Usage
+	Response() *Response
+}
+
+// InterruptibleStreamIterator is an optional capability for stream iterators
+// that can be actively interrupted by middleware such as timeout wrappers.
+//
+// Implementations should make best efforts to unblock any in-flight Next call
+// promptly after Interrupt is invoked. The provided error is advisory and can be
+// ignored if the iterator surfaces its own terminal error.
+type InterruptibleStreamIterator interface {
+	StreamIterator
+	Interrupt(error)
 }
 
 // Handler 处理函数定义 (用于中间件)
