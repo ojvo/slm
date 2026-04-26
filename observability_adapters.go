@@ -49,6 +49,11 @@ type TraceObserverOptions struct {
 	SpanPrefix string
 }
 
+// NewLogObserver returns a lifecycle observer that emits structured logs.
+func NewLogObserver(logger Logger) LifecycleObserver {
+	return &logObserver{logger: resolvedLogger(logger)}
+}
+
 // NewMetricsObserver returns an official metrics adapter built on LifecycleObserver.
 func NewMetricsObserver(meter Meter, opts MetricsObserverOptions) LifecycleObserver {
 	if meter == nil {
@@ -88,6 +93,56 @@ type metricsObserver struct {
 	promptTokens     Float64Histogram
 	completionTokens Float64Histogram
 	totalTokens      Float64Histogram
+}
+
+type logObserver struct {
+	logger Logger
+}
+
+func (o *logObserver) OnRequestStart(ctx context.Context, event LifecycleEvent) {
+	logRequestStart(o.logger, "LLM request start", GetRequestID(ctx), RequestDiagnosticFields(event.Request))
+}
+
+func (o *logObserver) OnRequestFinish(ctx context.Context, event LifecycleEvent) {
+	requestID := GetRequestID(ctx)
+	requestFields := RequestDiagnosticFields(event.Request)
+	if event.Err != nil {
+		logRequestFailure(o.logger, "LLM request failed", event.Duration, requestID, requestFields, event.Err)
+		return
+	}
+	if event.Response != nil {
+		logRequestCompleted(o.logger, "LLM request completed", event.Duration, requestID,
+			"tokens", event.Response.Usage.TotalTokens,
+			"finish_reason", event.Response.FinishReason,
+		)
+		return
+	}
+	logRequestCompleted(o.logger, "LLM request completed", event.Duration, requestID)
+}
+
+func (o *logObserver) OnStreamStart(ctx context.Context, event LifecycleEvent) {
+	logRequestStart(o.logger, "LLM stream start", GetRequestID(ctx), RequestDiagnosticFields(event.Request))
+}
+
+func (o *logObserver) OnStreamConnected(ctx context.Context, _ LifecycleEvent) {
+	logRequestCompleted(o.logger, "LLM stream connected", 0, GetRequestID(ctx))
+}
+
+func (o *logObserver) OnStreamFinish(ctx context.Context, event LifecycleEvent) {
+	requestID := GetRequestID(ctx)
+	requestFields := RequestDiagnosticFields(event.Request)
+	if event.Err != nil {
+		logRequestFailure(o.logger, "LLM stream closed with error", event.Duration, requestID, requestFields, event.Err)
+		return
+	}
+	tokens := 0
+	if event.Response != nil {
+		tokens = event.Response.Usage.TotalTokens
+	}
+	logRequestCompleted(o.logger, "LLM stream completed", event.Duration, requestID,
+		"tokens", tokens,
+		"model", requestModel(event.Request),
+	)
 }
 
 func (m *metricsObserver) OnRequestStart(ctx context.Context, event LifecycleEvent) {

@@ -342,11 +342,15 @@ rateLimitUnary, rateLimitStream, closer := slm.RateLimitMiddlewares(10, 5)
 defer closer()
 ```
 
-### 日志中间件
+### 日志观察器（推荐）
 
 ```go
 logger := slm.NewDefaultLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)))
-loggingMW := slm.LoggingMiddleware(logger)
+engine := slm.ApplyStandardMiddleware(baseEngine, slm.StandardMiddlewareOptions{
+    Observers: []slm.LifecycleObserver{
+        slm.NewLogObserver(logger),
+    },
+})
 ```
 
 ### 超时中间件
@@ -365,30 +369,39 @@ requestIDMW := slm.RequestIDMiddleware(nil)  // 使用默认 ID 生成器
 
 ```go
 engine := slm.ChainWithStream(baseEngine,
-    []slm.Middleware{rateLimit, retry, logging},
+    []slm.Middleware{rateLimit, retry},
     []slm.StreamMiddleware{rateLimitStream, retryStream},
 )
 ```
 
 ### 标准中间件链
 
-能力协商现在更推荐直接配置在协议 engine 或 `Config.BuildEngineWithTransport()` 上；标准链主要负责 request id、observer、logging、timeout、retry、rate limit 这类横切能力。只有在你需要包装一个已经存在、但本身不支持协议级协商的通用 engine 时，才需要把 capability negotiation 继续放在 middleware 层。
+能力协商现在更推荐直接配置在协议 engine 或 `Config.BuildEngineWithTransport()` 上；标准链主要负责 request id、observer、timeout、retry、rate limit 这类横切能力。只有在你需要包装一个已经存在、但本身不支持协议级协商的通用 engine 时，才需要把 capability negotiation 继续放在 middleware 层。
 
 如果没有非常特殊的排序需求，优先使用标准链构建器：
 
 ```go
 engine := slm.ApplyStandardMiddleware(baseEngine, slm.StandardMiddlewareOptions{
     EnableRequestID: true,
-    Logger:          logger,
     Timeout:         30 * time.Second,
     Retry:           &slm.RetryConfig{MaxAttempts: 3},
     RateLimit:       &slm.RateLimitConfig{Limit: 10, Burst: 5},
 })
 ```
 
+如果需要日志，优先通过 observer 统一接入：
+
+```go
+engine = slm.ApplyStandardMiddleware(engine, slm.StandardMiddlewareOptions{
+    Observers: []slm.LifecycleObserver{slm.NewLogObserver(logger)},
+})
+```
+
+`LoggingMiddleware` / `LoggingStreamMiddleware` 仍可用（兼容旧代码），但内部已复用 lifecycle observer 实现。
+
 标准链固定顺序为：
 
-`request_id -> capability negotiation -> lifecycle observers -> logging -> timeout -> retry -> rate limit -> engine`
+`request_id -> capability negotiation -> lifecycle observers -> timeout -> retry -> rate limit -> engine`
 
 ### 生命周期观察器
 
@@ -478,7 +491,11 @@ cfg := slm.DefaultConfig().
 engineFromConfig, err := cfg.BuildEngineWithTransport()
 ```
 
-`BuildEngineWithTransport()` 在检测到 capability negotiation 配置时，会自动构造带协议级协商的 OpenAI engine，而不是再额外包一层 capability middleware。
+`BuildEngineWithTransport()` 在检测到 capability negotiation 配置时，会通过标准中间件链统一应用协商（与 `BuildEngine(...)` 保持同一入口），避免默认路径出现双入口语义。
+
+推荐默认路径：通过 `Config.WithCapabilityNegotiation(...)` 或 `ApplyStandardMiddleware(..., StandardMiddlewareOptions{Capabilities: ...})` 接入协商。
+
+兼容路径：`OpenAIOptions.Capabilities` / `OpenAIResponsesOptions.Capabilities` 仍可用于“仅协议 engine、无标准中间件链”的场景。
 
 `/responses` 也是同一套协商入口，对应 engine 写法如下：
 
@@ -576,7 +593,6 @@ engine := slm.ApplyStandardMiddleware(baseEngine, slm.StandardMiddlewareOptions{
     Timeout:         30 * time.Second,
     Retry:           &slm.RetryConfig{MaxAttempts: 3},
     RateLimit:       &slm.RateLimitConfig{Limit: 10, Burst: 5},
-    Logger:          logger,
     Observers: []slm.LifecycleObserver{
         slm.NewMetricsObserver(meter, slm.MetricsObserverOptions{Namespace: "slm"}),
     },
@@ -627,7 +643,7 @@ engine, err := cfg.BuildEngine(func(p slm.ProviderConfig) (slm.Engine, error) {
 engineWithTransport, err := cfg.BuildEngineWithTransport()
 ```
 
-如果你本来就是在用 OpenAI 兼容协议，优先使用 `BuildEngineWithTransport()`，因为这条路径会把 capability negotiation 直接下沉到协议 engine；`BuildEngine(...)` 仍然适合非 OpenAI 协议或完全自定义的 engine 工厂。
+如果你本来就是在用 OpenAI 兼容协议，优先使用 `BuildEngineWithTransport()`；它会自动配置 HTTP/Transport 并复用同一套标准中间件协商链。`BuildEngine(...)` 仍然适合非 OpenAI 协议或完全自定义的 engine 工厂。
 
 ## 工具调用
 

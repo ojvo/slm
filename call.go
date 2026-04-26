@@ -126,6 +126,8 @@ func cloneRequest(req *Request) *Request {
 		return nil
 	}
 
+	clone := *req
+
 	msgs := make([]Message, len(req.Messages))
 	for i, msg := range req.Messages {
 		msgs[i] = Message{
@@ -137,46 +139,46 @@ func cloneRequest(req *Request) *Request {
 		}
 	}
 	tools := make([]Tool, len(req.Tools))
-	for i, t := range req.Tools {
-		tools[i] = Tool{
-			Name:        t.Name,
-			Description: t.Description,
-			Parameters:  deepCopyAny(t.Parameters),
-		}
-	}
+	copy(tools, req.Tools)
 
-	var extraBody map[string]any
-	if len(req.ExtraBody) > 0 {
-		extraBody = make(map[string]any, len(req.ExtraBody))
-		for k, v := range req.ExtraBody {
-			extraBody[k] = deepCopyAny(v)
-		}
-	}
+	clone.Messages = msgs
+	clone.Tools = tools
+	clone.Stop = append([]string(nil), req.Stop...)
+	clone.Meta = shallowCopyMap(req.Meta)
+	clone.ExtraBody = shallowCopyMap(req.ExtraBody)
+	clone.Temperature = cloneFloat64Ptr(req.Temperature)
+	clone.TopP = cloneFloat64Ptr(req.TopP)
+	clone.PresencePenalty = cloneFloat64Ptr(req.PresencePenalty)
+	clone.FrequencyPenalty = cloneFloat64Ptr(req.FrequencyPenalty)
+	clone.Reasoning = cloneReasoningOptions(req.Reasoning)
 
-	var meta map[string]any
-	if len(req.Meta) > 0 {
-		meta = make(map[string]any, len(req.Meta))
-		for k, v := range req.Meta {
-			meta[k] = deepCopyAny(v)
-		}
-	}
+	return &clone
+}
 
-	return &Request{
-		Model:            req.Model,
-		Messages:         msgs,
-		Temperature:      cloneFloat64Ptr(req.Temperature),
-		TopP:             cloneFloat64Ptr(req.TopP),
-		MaxTokens:        req.MaxTokens,
-		Stop:             append([]string(nil), req.Stop...),
-		PresencePenalty:  cloneFloat64Ptr(req.PresencePenalty),
-		FrequencyPenalty: cloneFloat64Ptr(req.FrequencyPenalty),
-		Stream:           req.Stream,
-		JSONMode:         req.JSONMode,
-		Reasoning:        cloneReasoningOptions(req.Reasoning),
-		Tools:            tools,
-		Meta:             meta,
-		ExtraBody:        extraBody,
+func cloneRequestShallow(req *Request) *Request {
+	if req == nil {
+		return nil
 	}
+	clone := *req
+	return &clone
+}
+
+func cloneRequestForMetadata(req *Request) *Request {
+	clone := cloneRequestShallow(req)
+	if clone == nil {
+		clone = &Request{}
+	}
+	clone.Meta = shallowCopyMap(clone.Meta)
+	return clone
+}
+
+func cloneRequestForRetry(req *Request) *Request {
+	clone := cloneRequestShallow(req)
+	if clone == nil {
+		return nil
+	}
+	clone.Meta = shallowCopyMap(clone.Meta)
+	return clone
 }
 
 func cloneReasoningOptions(reasoning *ReasoningOptions) *ReasoningOptions {
@@ -275,19 +277,15 @@ func extractBalanced(s string, open, close byte) string {
 	return s
 }
 
-func deepCopyAny(v any) any {
-	if v == nil {
+func shallowCopyMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
 		return nil
 	}
-	data, err := json.Marshal(v)
-	if err != nil {
-		return v
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
 	}
-	var result any
-	if err := json.Unmarshal(data, &result); err != nil {
-		return v
-	}
-	return result
+	return out
 }
 
 func cloneFloat64Ptr(p *float64) *float64 {

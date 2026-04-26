@@ -89,7 +89,10 @@ func retryUnary(ctx context.Context, req *Request, next Handler, cfg RetryConfig
 			return nil, err
 		}
 
-		retryReq := cloneRequest(req)
+		retryReq := req
+		if attempt > 1 {
+			retryReq = cloneRequestForRetry(req)
+		}
 		resp, err := next(ctx, retryReq)
 		if err == nil {
 			return resp, nil
@@ -115,7 +118,10 @@ func retryStream(ctx context.Context, req *Request, next StreamHandler, cfg Retr
 			return nil, err
 		}
 
-		retryReq := cloneRequest(req)
+		retryReq := req
+		if attempt > 1 {
+			retryReq = cloneRequestForRetry(req)
+		}
 		iter, err := next(ctx, retryReq)
 		if err == nil {
 			return &retryStreamIterator{
@@ -202,7 +208,7 @@ func (r *retryStreamIterator) openNextStreamAttempt() (StreamIterator, int, erro
 			return nil, 0, err
 		}
 
-		retryReq := cloneRequest(r.req)
+		retryReq := cloneRequestForRetry(r.req)
 		iter, err := r.next(r.ctx, retryReq)
 		if err != nil {
 			lastErr = err
@@ -267,6 +273,15 @@ func shouldStopRetry(attempt, maxAttempts int, err error, isRetryable func(error
 // waitRetry 等待重试间隔
 func waitRetry(ctx context.Context, attempt int, cfg RetryConfig) error {
 	delay := cfg.Backoff(attempt)
+	if delay <= 0 {
+		if ctx.Err() != nil {
+			if cfg.WrapError != nil {
+				return cfg.WrapError("context cancelled", ctx.Err())
+			}
+			return ctx.Err()
+		}
+		return nil
+	}
 	select {
 	case <-ctx.Done():
 		if cfg.WrapError != nil {

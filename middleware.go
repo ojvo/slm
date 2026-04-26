@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,16 +20,15 @@ type RateLimitConfig struct {
 // StandardMiddlewareOptions defines the recommended default middleware stack.
 //
 // Middleware order is fixed as:
-// request id -> request normalization -> capability negotiation -> lifecycle observers -> logging -> timeout -> retry -> rate limit -> engine
+// request id -> request normalization -> capability negotiation -> lifecycle observers -> timeout -> retry -> rate limit -> engine
 //
-// This keeps request correlation visible in logs, bounds total request time,
-// applies retries within the timeout window, and charges rate limits per
+// This bounds total request time, applies retries within the timeout window,
+// and charges rate limits per
 // underlying attempt rather than per logical request.
 type StandardMiddlewareOptions struct {
 	DefaultModel       string
 	Capabilities       *CapabilityNegotiationOptions
 	Observers          []LifecycleObserver
-	Logger             Logger
 	Retry              *RetryConfig
 	Timeout            time.Duration
 	EnableRequestID    bool
@@ -97,11 +97,6 @@ func ApplyStandardMiddleware(engine Engine, opts StandardMiddlewareOptions) Engi
 		observerUnary, observerStream := LifecycleObserverMiddleware(observer)
 		middlewares = append(middlewares, observerUnary)
 		streamMiddlewares = append(streamMiddlewares, observerStream)
-	}
-
-	if opts.Logger != nil {
-		middlewares = append(middlewares, LoggingMiddleware(opts.Logger))
-		streamMiddlewares = append(streamMiddlewares, LoggingStreamMiddleware(opts.Logger))
 	}
 
 	if opts.Timeout > 0 {
@@ -314,121 +309,14 @@ func (l *simpleLimiter) Wait(ctx context.Context) error {
 
 // LoggingMiddleware 创建日志中间件
 func LoggingMiddleware(logger Logger) Middleware {
-	if logger == nil {
-		logger = &NopLogger{}
-	}
-	return func(next Handler) Handler {
-		return func(ctx context.Context, req *Request) (*Response, error) {
-			requestID := GetRequestID(ctx)
-			logger.Debug("LLM request start", append([]any{"request_id", requestID}, RequestDiagnosticFields(req)...)...)
-			start := time.Now()
-
-			resp, err := next(ctx, req)
-
-			duration := time.Since(start)
-			if err != nil {
-				args := append([]any{"duration", duration, "request_id", requestID}, RequestDiagnosticFields(req)...)
-				args = append(args, ErrorDiagnosticFields(err)...)
-				logger.Error("LLM request failed", args...)
-			} else if resp != nil {
-				logger.Debug("LLM request completed",
-					"duration", duration,
-					"tokens", resp.Usage.TotalTokens,
-					"finish_reason", resp.FinishReason,
-					"request_id", requestID,
-				)
-			} else {
-				logger.Debug("LLM request completed", "duration", duration, "request_id", requestID)
-			}
-
-			return resp, err
-		}
-	}
+	unary, _ := lifecycleObserverMiddlewareWithOwner(NewLogObserver(logger), telemetryOwnerLogging)
+	return unary
 }
 
 // LoggingStreamMiddleware 创建流式日志中间件
 func LoggingStreamMiddleware(logger Logger) StreamMiddleware {
-	if logger == nil {
-		logger = &NopLogger{}
-	}
-	return func(next StreamHandler) StreamHandler {
-		return func(ctx context.Context, req *Request) (StreamIterator, error) {
-			requestID := GetRequestID(ctx)
-			logger.Debug("LLM stream start", append([]any{"request_id", requestID}, RequestDiagnosticFields(req)...)...)
-			start := time.Now()
-
-			iter, err := next(ctx, req)
-
-			duration := time.Since(start)
-			if err != nil {
-				args := append([]any{"duration", duration, "request_id", requestID}, RequestDiagnosticFields(req)...)
-				args = append(args, ErrorDiagnosticFields(err)...)
-				logger.Error("LLM stream failed", args...)
-				return nil, err
-			}
-
-			logger.Debug("LLM stream connected", "duration", duration, "request_id", requestID)
-
-			return &loggingStreamIterator{
-				inner:     iter,
-				logger:    logger,
-				start:     start,
-				model:     requestModel(req),
-				request:   cloneRequest(req),
-				requestID: requestID,
-			}, nil
-		}
-	}
-}
-
-type loggingStreamIterator struct {
-	inner     StreamIterator
-	logger    Logger
-	start     time.Time
-	model     string
-	request   *Request
-	requestID string
-	closeOnce sync.Once
-	closeErr  error
-}
-
-func (l *loggingStreamIterator) Next() bool {
-	ok := l.inner.Next()
-	if !ok {
-		_ = l.Close()
-	}
-	return ok
-}
-func (l *loggingStreamIterator) Chunk() []byte       { return l.inner.Chunk() }
-func (l *loggingStreamIterator) Text() string        { return l.inner.Text() }
-func (l *loggingStreamIterator) FullText() string    { return l.inner.FullText() }
-func (l *loggingStreamIterator) Err() error          { return l.inner.Err() }
-func (l *loggingStreamIterator) Usage() *Usage       { return l.inner.Usage() }
-func (l *loggingStreamIterator) Response() *Response { return l.inner.Response() }
-func (l *loggingStreamIterator) Interrupt(err error) { interruptStreamIterator(l.inner, err) }
-func (l *loggingStreamIterator) Close() error {
-	l.closeOnce.Do(func() {
-		usage := l.inner.Usage()
-		l.closeErr = l.inner.Close()
-		duration := time.Since(l.start)
-
-		if l.closeErr != nil {
-			args := append([]any{"duration", duration, "request_id", l.requestID}, RequestDiagnosticFields(l.request)...)
-			args = append(args, ErrorDiagnosticFields(l.closeErr)...)
-			l.logger.Error("LLM stream closed with error", args...)
-		} else if usage != nil {
-			l.logger.Debug("LLM stream completed",
-				"duration", duration,
-				"tokens", usage.TotalTokens,
-				"model", l.model,
-				"request_id", l.requestID,
-			)
-		} else {
-			l.logger.Debug("LLM stream completed", "duration", duration, "model", l.model, "request_id", l.requestID)
-		}
-	})
-
-	return l.closeErr
+	_, stream := lifecycleObserverMiddlewareWithOwner(NewLogObserver(logger), telemetryOwnerLogging)
+	return stream
 }
 
 // TimeoutMiddleware 创建超时控制中间件
@@ -553,10 +441,7 @@ func RequestIDMiddleware(generator func() string) Middleware {
 				ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
 			}
 
-			cloned := cloneRequest(req)
-			if cloned == nil {
-				cloned = &Request{}
-			}
+			cloned := cloneRequestForMetadata(req)
 			if cloned.Meta == nil {
 				cloned.Meta = make(map[string]any)
 			}
@@ -581,6 +466,22 @@ func RequestIDMiddleware(generator func() string) Middleware {
 
 type ctxKeyRequestID struct{}
 
+type telemetryOwner string
+
+const (
+	telemetryOwnerLogging  telemetryOwner = "logging"
+	telemetryOwnerObserver telemetryOwner = "observer"
+)
+
+type ctxKeyTelemetryOwner struct{}
+
+func claimTelemetryOwnership(ctx context.Context, owner telemetryOwner) (context.Context, bool) {
+	if existing, ok := ctx.Value(ctxKeyTelemetryOwner{}).(telemetryOwner); ok {
+		return ctx, existing == owner
+	}
+	return context.WithValue(ctx, ctxKeyTelemetryOwner{}, owner), true
+}
+
 // RequestIDStreamMiddleware 创建流式请求的请求ID追踪中间件
 func RequestIDStreamMiddleware(generator func() string) StreamMiddleware {
 	if generator == nil {
@@ -594,10 +495,7 @@ func RequestIDStreamMiddleware(generator func() string) StreamMiddleware {
 				ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
 			}
 
-			cloned := cloneRequest(req)
-			if cloned == nil {
-				cloned = &Request{}
-			}
+			cloned := cloneRequestForMetadata(req)
 			if cloned.Meta == nil {
 				cloned.Meta = make(map[string]any)
 			}
@@ -678,10 +576,21 @@ func normalizeRequestForOperation(req *Request, defaultModel string, stream bool
 	if req == nil {
 		return nil
 	}
-	clone := cloneRequest(req)
+
+	model := strings.TrimSpace(req.Model)
+	resolvedModel := model
+	if resolvedModel == "" {
+		resolvedModel = strings.TrimSpace(defaultModel)
+	}
+
+	if req.Stream == stream && model == resolvedModel {
+		return req
+	}
+
+	clone := cloneRequestShallow(req)
 	clone.Stream = stream
-	if strings.TrimSpace(clone.Model) == "" {
-		clone.Model = strings.TrimSpace(defaultModel)
+	if model == "" {
+		clone.Model = resolvedModel
 	}
 	return clone
 }
@@ -693,7 +602,13 @@ func interruptStreamIterator(iter StreamIterator, err error) {
 }
 
 func generateRequestID() string {
-	return fmt.Sprintf("req_%d_%d", time.Now().UnixNano(), requestCounter.Add(1))
+	var buf [64]byte
+	b := buf[:0]
+	b = append(b, "req_"...)
+	b = strconv.AppendInt(b, time.Now().UnixNano(), 10)
+	b = append(b, '_')
+	b = strconv.AppendInt(b, requestCounter.Add(1), 10)
+	return string(b)
 }
 
 var requestCounter atomic.Int64

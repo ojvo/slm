@@ -2,6 +2,7 @@ package slm
 
 import (
 	"log/slog"
+	"time"
 )
 
 // Logger 是 LLM 包的日志接口
@@ -34,3 +35,30 @@ func (NopLogger) Info(string, ...any)  {}
 func (NopLogger) Debug(string, ...any) {}
 func (NopLogger) Warn(string, ...any)  {}
 func (NopLogger) Error(string, ...any) {}
+
+func resolvedLogger(logger Logger) Logger {
+	if logger == nil {
+		return NopLogger{}
+	}
+	return logger
+}
+
+func logRequestStart(logger Logger, msg, requestID string, requestFields []any) {
+	logger = resolvedLogger(logger)
+	args := append([]any{"request_id", requestID}, requestFields...)
+	logger.Debug(msg, args...)
+}
+
+func logRequestFailure(logger Logger, msg string, duration time.Duration, requestID string, requestFields []any, err error) {
+	logger = resolvedLogger(logger)
+	args := append([]any{"duration", duration, "request_id", requestID}, requestFields...)
+	args = append(args, ErrorDiagnosticFields(err)...)
+	logger.Error(msg, args...)
+}
+
+func logRequestCompleted(logger Logger, msg string, duration time.Duration, requestID string, extra ...any) {
+	logger = resolvedLogger(logger)
+	args := []any{"duration", duration, "request_id", requestID}
+	args = append(args, extra...)
+	logger.Debug(msg, args...)
+}

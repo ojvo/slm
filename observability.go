@@ -70,8 +70,17 @@ func (o compositeLifecycleObserver) OnStreamFinish(ctx context.Context, event Li
 // LifecycleObserverMiddleware creates unary and stream middlewares that emit
 // structured lifecycle events to the supplied observer.
 func LifecycleObserverMiddleware(observer LifecycleObserver) (Middleware, StreamMiddleware) {
+	return lifecycleObserverMiddlewareWithOwner(observer, telemetryOwnerObserver)
+}
+
+func lifecycleObserverMiddlewareWithOwner(observer LifecycleObserver, owner telemetryOwner) (Middleware, StreamMiddleware) {
 	unary := func(next Handler) Handler {
 		return func(ctx context.Context, req *Request) (*Response, error) {
+			ctx, owns := claimTelemetryOwnership(ctx, owner)
+			if !owns {
+				return next(ctx, req)
+			}
+
 			event := LifecycleEvent{OperationID: generateOperationID(), RequestID: GetRequestID(ctx), Model: requestModel(req), Context: ctx, Request: req}
 			observer.OnRequestStart(ctx, event)
 			start := time.Now()
@@ -87,6 +96,11 @@ func LifecycleObserverMiddleware(observer LifecycleObserver) (Middleware, Stream
 
 	stream := func(next StreamHandler) StreamHandler {
 		return func(ctx context.Context, req *Request) (StreamIterator, error) {
+			ctx, owns := claimTelemetryOwnership(ctx, owner)
+			if !owns {
+				return next(ctx, req)
+			}
+
 			event := LifecycleEvent{OperationID: generateOperationID(), RequestID: GetRequestID(ctx), Model: requestModel(req), Context: ctx, Request: req, Stream: true}
 			observer.OnStreamStart(ctx, event)
 			start := time.Now()

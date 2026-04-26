@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -14,20 +15,20 @@ import (
 	"sync/atomic"
 	"time"
 
-	"ojv/sto/copilot"
-	"ojv/sto/copilot/slmbridge"
-	"ojv/sto/slm"
+	"ojv/slm"
 )
 
-var defaultAPIKey = ""
-
-func getAPIKey() string {
+// getAPIKey 支持 ProviderConfig.DefaultAPIKey 作为 fallback。
+// 若传入 providerCfg，优先级：环境变量 > providerCfg.DefaultAPIKey > slm.DefaultAPIKey
+func getAPIKey(providerCfg *slm.ProviderConfig) string {
 	if key := os.Getenv("SLM_API_KEY"); key != "" {
 		return key
 	}
-	return defaultAPIKey
+	if providerCfg != nil && providerCfg.DefaultAPIKey != "" {
+		return providerCfg.DefaultAPIKey
+	}
+	return slm.DefaultAPIKey
 }
-
 func main() {
 	example := flag.String("example", "basic", "Available examples:\n\n"+
 		"  01-BASIC (入门)\n"+
@@ -66,17 +67,45 @@ func main() {
 
 	flag.Parse()
 
-	engine := slm.NewOpenAIProtocol(
-		"https://models.inference.ai.azure.com",
-		getAPIKey(),
-		"gpt-4o-mini",
-	)
+	// 读取 config.json
+	configPath := "config.json"
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		configPath = "config.json"
+	}
+	var providerCfg slm.ProviderConfig
+	if data, err := ioutil.ReadFile(configPath); err == nil {
+		var cfg struct {
+			Endpoint      string `json:"endpoint"`
+			DefaultModel  string `json:"default_model"`
+			DefaultAPIKey string `json:"default_api_key"`
+			APIKey        string `json:"api_key"`
+		}
+		if err := json.Unmarshal(data, &cfg); err == nil {
+			providerCfg.Endpoint = cfg.Endpoint
+			providerCfg.DefaultModel = cfg.DefaultModel
+			providerCfg.DefaultAPIKey = cfg.DefaultAPIKey
+			if cfg.APIKey != "" {
+				providerCfg.DefaultAPIKey = cfg.APIKey
+			}
+		}
+	}
+	if providerCfg.Endpoint == "" {
+		providerCfg.Endpoint = "https://models.inference.ai.azure.com"
+	}
+	if providerCfg.DefaultModel == "" {
+		providerCfg.DefaultModel = "gpt-4o-mini"
+	}
 
+	engine := slm.NewOpenAIProtocol(
+		providerCfg.Endpoint,
+		getAPIKey(&providerCfg),
+		providerCfg.DefaultModel,
+	)
 	ctx := context.Background()
 
 	switch *example {
 	case "all":
-		runAll(ctx, engine)
+		runAll(ctx, engine, &providerCfg)
 	case "basic":
 		runBasic(ctx, engine)
 	case "parameters":
@@ -87,7 +116,7 @@ func main() {
 	case "streaming":
 		runStreaming(ctx, engine)
 	case "responses":
-		runResponses(ctx)
+		runResponses(ctx, &providerCfg)
 	case "tool_calling":
 		runToolCalling(ctx, engine)
 	case "generic":
@@ -102,9 +131,9 @@ func main() {
 	case "config":
 		runConfig()
 	case "custom_http":
-		runCustomHTTP()
+		runCustomHTTP(&providerCfg)
 	case "capabilities":
-		runCapabilities(ctx, engine)
+		runCapabilities(ctx, engine, &providerCfg)
 	case "observability":
 		runObservability(ctx, engine)
 
@@ -140,7 +169,7 @@ func main() {
 	}
 }
 
-func runAll(ctx context.Context, engine slm.Engine) {
+func runAll(ctx context.Context, engine slm.Engine, providerCfg *slm.ProviderConfig) {
 	examples := []struct {
 		name string
 		fn   func()
@@ -149,15 +178,15 @@ func runAll(ctx context.Context, engine slm.Engine) {
 		{"parameters", func() { runParameters(ctx, engine) }},
 		{"json_mode", func() { runJSONMode(ctx, engine) }},
 		{"streaming", func() { runStreaming(ctx, engine) }},
-		{"responses", func() { runResponses(ctx) }},
+		{"responses", func() { runResponses(ctx, providerCfg) }},
 		{"tool_calling", func() { runToolCalling(ctx, engine) }},
 		{"generic", func() { runGeneric(ctx, engine) }},
 		{"reasoning", func() { runReasoning(ctx, engine) }},
 		{"middleware", func() { runMiddleware(engine) }},
 		{"error_handling", func() { runErrorHandling(ctx, engine) }},
 		{"config", func() { runConfig() }},
-		{"custom_http", func() { runCustomHTTP() }},
-		{"capabilities", func() { runCapabilities(ctx, engine) }},
+		{"custom_http", func() { runCustomHTTP(providerCfg) }},
+		{"capabilities", func() { runCapabilities(ctx, engine, providerCfg) }},
 		{"observability", func() { runObservability(ctx, engine) }},
 		{"conversation", func() { runConversation(ctx, engine) }},
 		{"batch", func() { runBatch(ctx, engine) }},
@@ -358,14 +387,14 @@ func runStreaming(ctx context.Context, engine slm.Engine) {
 	}
 }
 
-func runResponses(ctx context.Context) {
+func runResponses(ctx context.Context, providerCfg *slm.ProviderConfig) {
 	fmt.Println("========================================")
 	fmt.Println("  RESPONSES: OpenAI Responses API")
 	fmt.Println("========================================")
 
 	engine := slm.NewOpenAIResponsesProtocolWithOptions(
-		"https://models.inference.ai.azure.com",
-		getAPIKey(),
+		providerCfg.Endpoint,
+		getAPIKey(providerCfg),
 		slm.OpenAIResponsesOptions{
 			DefaultModel: "gpt-4o-mini",
 			Capabilities: &slm.CapabilityNegotiationOptions{
@@ -760,7 +789,7 @@ func runConfig() {
 	fmt.Printf("Config:\n%s\n", string(data))
 
 	engine, err := cfg.BuildEngine(func(p slm.ProviderConfig) (slm.Engine, error) {
-		return slm.NewOpenAIProtocol(p.Endpoint, getAPIKey(), p.DefaultModel), nil
+		return slm.NewOpenAIProtocol(p.Endpoint, getAPIKey(&p), p.DefaultModel), nil
 	})
 	if err != nil {
 		fmt.Printf("Build failed: %v\n", err)
@@ -770,7 +799,7 @@ func runConfig() {
 	fmt.Println("✅ Engine built with middleware applied automatically")
 }
 
-func runCustomHTTP() {
+func runCustomHTTP(providerCfg *slm.ProviderConfig) {
 	fmt.Println("========================================")
 	fmt.Println("  CUSTOM HTTP: Transport Settings")
 	fmt.Println("========================================")
@@ -791,8 +820,8 @@ func runCustomHTTP() {
 	}
 
 	transport := slm.NewHTTPTransportWithClient(client,
-		"https://models.inference.ai.azure.com",
-		getAPIKey(),
+		providerCfg.Endpoint,
+		getAPIKey(providerCfg),
 	)
 	engine := slm.NewOpenAIWithTransport(transport, "gpt-4o-mini")
 
@@ -822,48 +851,43 @@ func runCustomHTTP() {
 	fmt.Printf("   - KeepAlive: 30s\n")
 }
 
-func runCapabilities(ctx context.Context, engine slm.Engine) {
+func runCapabilities(ctx context.Context, engine slm.Engine, providerCfg *slm.ProviderConfig) {
 	fmt.Println("========================================")
 	fmt.Println("  CAPABILITIES: Explicit Negotiation")
 	fmt.Println("========================================")
 
 	resolver := slm.ChainCapabilityResolvers(
-		slmbridge.StaticResolver([]copilot.Model{
-			{
-				ID: "gpt-4o-mini",
-				Capabilities: copilot.ModelCapabilities{
-					Supports: copilot.ModelSupports{
-						StructuredOutputs: true,
-						ToolCalls:         true,
-						Vision:            true,
-						AdaptiveThinking:  true,
-						ReasoningEffort:   []string{"low", "medium", "high"},
-					},
+		slm.StaticCapabilityResolver{
+			"gpt-4o-mini": {
+				Supports: slm.CapabilitySet{
+					JSONMode:  true,
+					ToolCalls: true,
+					Vision:    true,
+					Reasoning: true,
 				},
 			},
-		}),
+		},
 		slm.StaticCapabilityResolver{
 			"*": {Supports: slm.CapabilitySet{JSONMode: true}},
 		},
 	)
 
 	fmt.Println("Resolver chain:")
-	fmt.Println("  1. Copilot model catalog bridge -> slm.CapabilityResolver")
+	fmt.Println("  1. Static model capability table")
 	fmt.Println("  2. Generic slm fallback for unknown models")
 
-	capabilityEngine := slm.NewOpenAIProtocolWithOptions(
-		"https://models.inference.ai.azure.com",
-		getAPIKey(),
-		slm.OpenAIOptions{
-			DefaultModel: "gpt-4o-mini",
-			Capabilities: &slm.CapabilityNegotiationOptions{
-				Resolver:     resolver,
-				DefaultModel: "gpt-4o-mini",
-				RequireKnown: true,
-			},
-		},
+	base := slm.NewOpenAIProtocol(
+		providerCfg.Endpoint,
+		getAPIKey(providerCfg),
+		providerCfg.DefaultModel,
 	)
-	wrapped := slm.ApplyStandardMiddleware(capabilityEngine, slm.StandardMiddlewareOptions{
+	wrapped := slm.ApplyStandardMiddleware(base, slm.StandardMiddlewareOptions{
+		DefaultModel: "gpt-4o-mini",
+		Capabilities: &slm.CapabilityNegotiationOptions{
+			Resolver:     resolver,
+			DefaultModel: "gpt-4o-mini",
+			RequireKnown: true,
+		},
 		Observers: []slm.LifecycleObserver{capabilityPrinterObserver{}},
 	})
 

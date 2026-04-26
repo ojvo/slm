@@ -274,12 +274,21 @@ func NegotiateRequestCapabilities(ctx context.Context, req *Request, opts Capabi
 		return ctx, req, nil
 	}
 	requested := DetectRequestedCapabilities(req)
+	if negotiated, ok := reusableNegotiatedCapabilities(ctx, req.Model, requested, opts.DefaultModel); ok {
+		if req.Model == "" && negotiated.Model != "" {
+			clone := cloneRequestShallow(req)
+			clone.Model = negotiated.Model
+			req = clone
+		}
+		return ctx, req, nil
+	}
+
 	ctx, model, err := negotiateCapabilities(ctx, req.Model, requested, opts)
 	if err != nil {
 		return ctx, req, err
 	}
 	if req.Model == "" && model != "" {
-		clone := cloneRequest(req)
+		clone := cloneRequestShallow(req)
 		clone.Model = model
 		req = clone
 	}
@@ -292,6 +301,15 @@ func NegotiateResponseCapabilities(ctx context.Context, req *ResponseRequest, op
 		return ctx, req, nil
 	}
 	requested := DetectRequestedResponseCapabilities(req)
+	if negotiated, ok := reusableNegotiatedCapabilities(ctx, req.Model, requested, opts.DefaultModel); ok {
+		if req.Model == "" && negotiated.Model != "" {
+			clone := cloneResponseRequest(req)
+			clone.Model = negotiated.Model
+			req = clone
+		}
+		return ctx, req, nil
+	}
+
 	ctx, model, err := negotiateCapabilities(ctx, req.Model, requested, opts)
 	if err != nil {
 		return ctx, req, err
@@ -378,4 +396,25 @@ func GetNegotiatedCapabilities(ctx context.Context) (NegotiatedCapabilities, boo
 
 func withNegotiatedCapabilities(ctx context.Context, negotiated NegotiatedCapabilities) context.Context {
 	return context.WithValue(ctx, ctxKeyNegotiatedCapabilities{}, negotiated)
+}
+
+func reusableNegotiatedCapabilities(ctx context.Context, requestedModel string, requested CapabilitySet, defaultModel string) (NegotiatedCapabilities, bool) {
+	negotiated, ok := GetNegotiatedCapabilities(ctx)
+	if !ok {
+		return NegotiatedCapabilities{}, false
+	}
+	if negotiated.Requested != requested {
+		return NegotiatedCapabilities{}, false
+	}
+
+	resolvedModel := strings.TrimSpace(requestedModel)
+	if resolvedModel == "" {
+		resolvedModel = strings.TrimSpace(defaultModel)
+	}
+
+	if resolvedModel != "" && negotiated.Model != "" && resolvedModel != negotiated.Model {
+		return NegotiatedCapabilities{}, false
+	}
+
+	return negotiated, true
 }
