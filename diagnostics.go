@@ -62,7 +62,7 @@ func RequestDiagnosticFields(req *Request) []any {
 		"max_tokens", req.MaxTokens,
 		"stop_count", len(req.Stop),
 		"meta_keys", len(req.Meta),
-		"extra_body_keys", len(req.ExtraBody),
+		"capabilities_keys", len(req.Capabilities),
 	}
 }
 
@@ -97,7 +97,7 @@ func ResponseRequestDiagnosticFields(req *ResponseRequest) []any {
 		"reasoning_summary", reasoningSummary,
 		"max_output_tokens", req.MaxOutputTokens,
 		"store", req.Store,
-		"extra_body_keys", len(req.ExtraBody),
+		"capabilities_keys", len(req.Capabilities),
 	}
 }
 

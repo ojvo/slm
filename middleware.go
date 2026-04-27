@@ -734,7 +734,7 @@ func NormalizeResponseRequestStreamMiddleware(defaultModel string) ResponseStrea
 
 func ApplyStandardMiddleware(engine Engine, opts StandardMiddlewareOptions) Engine {
 	pipeline := applyStandardMiddleware(chatSuite, enginePipelineAdapter{engine}, opts)
-	return &enginePipelineBridge{pipeline: pipeline}
+	return &enginePipelineBridge{pipeline: pipeline, engine: engine}
 }
 
 func ApplyStandardResponseMiddleware(engine *OpenAIResponsesEngine, opts StandardMiddlewareOptions) *OpenAIResponsesEngine {
@@ -753,7 +753,7 @@ func ChainWithStreamAndClosers(engine Engine, middlewares []Middleware, streamMi
 	pipeline := ChainPipelineWithStreamAndClosers[*Request, *Response, StreamIterator](
 		enginePipelineAdapter{engine}, middlewares, streamMiddlewares, closers,
 	)
-	return &enginePipelineBridge{pipeline: pipeline}
+	return &enginePipelineBridge{pipeline: pipeline, engine: engine}
 }
 
 type enginePipelineAdapter struct{ Engine }
@@ -767,6 +767,7 @@ func (a enginePipelineAdapter) Stream(ctx context.Context, req *Request) (Stream
 
 type enginePipelineBridge struct {
 	pipeline PipelineEngine[*Request, *Response, StreamIterator]
+	engine   Engine
 }
 
 func (b *enginePipelineBridge) Generate(ctx context.Context, req *Request) (*Response, error) {
@@ -774,6 +775,12 @@ func (b *enginePipelineBridge) Generate(ctx context.Context, req *Request) (*Res
 }
 func (b *enginePipelineBridge) Stream(ctx context.Context, req *Request) (StreamIterator, error) {
 	return b.pipeline.Stream(ctx, req)
+}
+func (b *enginePipelineBridge) Capabilities() *ProtocolCapabilities {
+	if b.engine != nil {
+		return b.engine.Capabilities()
+	}
+	return nil
 }
 func (b *enginePipelineBridge) Close() {
 	if closer, ok := b.pipeline.(PipelineCloser); ok {

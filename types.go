@@ -2,6 +2,7 @@ package slm
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -71,9 +72,9 @@ type Message struct {
 // -----------------------------------------------------------------------------
 
 type RequestIdentity struct {
-	Model     string         `json:"model"`
-	Meta      map[string]any `json:"meta,omitempty"`
-	ExtraBody map[string]any `json:"extra_body,omitempty"`
+	Model        string         `json:"model"`
+	Meta         map[string]any `json:"meta,omitempty"`
+	Capabilities map[string]any `json:"capabilities,omitempty"`
 }
 
 func (r RequestIdentity) GetModel() string { return r.Model }
@@ -94,10 +95,50 @@ type Request struct {
 	Reasoning        *ReasoningOptions
 	Tools            []Tool
 	Meta             map[string]any
-	ExtraBody        map[string]any
+	// Capabilities holds protocol-specific parameters not represented in standard fields.
+	// Use this for advanced parameters like reasoning_effort, thinking_budget, etc.
+	// Replaces legacy ExtraBody field while maintaining backward compatibility.
+	Capabilities map[string]any
 }
 
 func (r *Request) GetModel() string { return r.Model }
+
+// ValidateFor checks if this request's capabilities are supported by the engine.
+// Returns an error if unsupported parameters are used or conflicting parameters are specified.
+func (r *Request) ValidateFor(engine Engine) error {
+	if engine == nil {
+		return NewLLMError(ErrCodeInvalidConfig, "engine is nil", nil)
+	}
+	caps := engine.Capabilities()
+	if caps == nil {
+		return nil // Engine doesn't declare capabilities (fallback mode)
+	}
+
+	// Check for unsupported parameters
+	for param := range r.Capabilities {
+		if _, supported := caps.SupportedParameters[param]; !supported {
+			return NewLLMError(ErrCodeInvalidConfig,
+				fmt.Sprintf("parameter %q not supported by this protocol", param), nil)
+		}
+	}
+
+	// Check for conflicting parameters
+	for _, conflict := range caps.ConflictingParameters {
+		count := 0
+		var present []string
+		for _, param := range conflict {
+			if _, exists := r.Capabilities[param]; exists {
+				count++
+				present = append(present, param)
+			}
+		}
+		if count > 1 {
+			return NewLLMError(ErrCodeInvalidConfig,
+				fmt.Sprintf("conflicting parameters cannot be used together: %v", present), nil)
+		}
+	}
+	return nil
+}
 
 // Response is the normalized chat response returned by Engine.
 type Response struct {
@@ -186,10 +227,48 @@ type ResponseRequest struct {
 	MaxOutputTokens int
 	Reasoning       *ResponseReasoning
 	Tools           []ResponseTool
-	ExtraBody       map[string]any
+	// Capabilities holds protocol-specific parameters not represented in standard fields.
+	Capabilities map[string]any
 }
 
 func (r *ResponseRequest) GetModel() string { return r.Model }
+
+// ValidateFor checks if this response request's capabilities are supported by the engine.
+// Returns an error if unsupported parameters are used or conflicting parameters are specified.
+func (r *ResponseRequest) ValidateFor(engine *OpenAIResponsesEngine) error {
+	if engine == nil {
+		return NewLLMError(ErrCodeInvalidConfig, "engine is nil", nil)
+	}
+	caps := engine.Capabilities()
+	if caps == nil {
+		return nil // Engine doesn't declare capabilities (fallback mode)
+	}
+
+	// Check for unsupported parameters
+	for param := range r.Capabilities {
+		if _, supported := caps.SupportedParameters[param]; !supported {
+			return NewLLMError(ErrCodeInvalidConfig,
+				fmt.Sprintf("parameter %q not supported by Responses API", param), nil)
+		}
+	}
+
+	// Check for conflicting parameters
+	for _, conflict := range caps.ConflictingParameters {
+		count := 0
+		var present []string
+		for _, param := range conflict {
+			if _, exists := r.Capabilities[param]; exists {
+				count++
+				present = append(present, param)
+			}
+		}
+		if count > 1 {
+			return NewLLMError(ErrCodeInvalidConfig,
+				fmt.Sprintf("conflicting parameters cannot be used together: %v", present), nil)
+		}
+	}
+	return nil
+}
 
 // ResponseOutputContent is one content block in a /responses output item.
 type ResponseOutputContent struct {
@@ -383,10 +462,74 @@ func (w *responseStreamWrapper) Close() error {
 	return nil
 }
 
+// ParameterRange describes valid values or bounds for a protocol parameter.
+type ParameterRange struct {
+	Min    float64  // Minimum value (for numeric params)
+	Max    float64  // Maximum value (for numeric params)
+	Values []string // Allowed values (for enum params)
+}
+
+// ProtocolCapabilities describes what parameters a protocol/model supports.
+// It enables transparent capability negotiation across different LLM providers.
+type ProtocolCapabilities struct {
+	// SupportedParameters lists protocol-specific parameters beyond standard Request fields.
+	// Standard parameters (Temperature, TopP, MaxTokens, etc.) are always supported
+	// if supported by the Request type. This maps additional parameters to their valid ranges.
+	SupportedParameters map[string]ParameterRange
+	// ParameterMapping maps generic parameter names to protocol-specific wire names.
+	// E.g., {"reasoning_effort": "reasoning_effort"} for OpenAI o1.
+	ParameterMapping map[string]string
+	// ConflictingParameters lists groups of parameters that cannot be used together.
+	// E.g., [["reasoning", "stream"]] means reasoning and stream cannot both be true.
+	ConflictingParameters [][]string
+	// Description provides human-readable info about the protocol capabilities.
+	Description string
+}
+
+func cloneProtocolCapabilities(template ProtocolCapabilities) *ProtocolCapabilities {
+	clone := ProtocolCapabilities{
+		SupportedParameters:   make(map[string]ParameterRange, len(template.SupportedParameters)),
+		ParameterMapping:      make(map[string]string, len(template.ParameterMapping)),
+		ConflictingParameters: make([][]string, len(template.ConflictingParameters)),
+		Description:           template.Description,
+	}
+
+	for key, value := range template.SupportedParameters {
+		clonedRange := ParameterRange{Min: value.Min, Max: value.Max}
+		if len(value.Values) > 0 {
+			clonedRange.Values = append([]string(nil), value.Values...)
+		}
+		clone.SupportedParameters[key] = clonedRange
+	}
+
+	for key, value := range template.ParameterMapping {
+		clone.ParameterMapping[key] = value
+	}
+
+	for i, conflictGroup := range template.ConflictingParameters {
+		clone.ConflictingParameters[i] = append([]string(nil), conflictGroup...)
+	}
+
+	return &clone
+}
+
 // Engine LLM 核心引擎接口
 type Engine interface {
 	Generate(ctx context.Context, req *Request) (*Response, error)
 	Stream(ctx context.Context, req *Request) (StreamIterator, error)
+	// Capabilities returns the protocol capabilities supported by this engine.
+	// Returns nil if the engine does not declare capabilities (fallback mode).
+	Capabilities() *ProtocolCapabilities
+}
+
+// ResponsesEngine is the interface for Responses API engines.
+// It handles reasoning-focused completion requests separately from chat requests.
+type ResponsesEngine interface {
+	Create(ctx context.Context, req *ResponseRequest) (*ResponseObject, error)
+	Stream(ctx context.Context, req *ResponseRequest) (ResponseStream, error)
+	Close() error
+	// Capabilities returns the protocol capabilities supported by this responses engine.
+	Capabilities() *ProtocolCapabilities
 }
 
 type protocolBase struct {

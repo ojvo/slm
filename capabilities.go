@@ -221,7 +221,7 @@ func DetectRequestedCapabilities(req *Request) CapabilitySet {
 	requested := CapabilitySet{
 		JSONMode:  req.JSONMode,
 		ToolCalls: len(req.Tools) > 0,
-		Reasoning: req.Reasoning != nil || hasLegacyReasoningRequest(req.ExtraBody),
+		Reasoning: req.Reasoning != nil || hasLegacyReasoningRequest(req.Capabilities),
 	}
 
 	for _, msg := range req.Messages {
@@ -243,7 +243,7 @@ func DetectRequestedResponseCapabilities(req *ResponseRequest) CapabilitySet {
 	}
 	return CapabilitySet{
 		ToolCalls: len(req.Tools) > 0,
-		Reasoning: req.Reasoning != nil || hasLegacyReasoningRequest(req.ExtraBody),
+		Reasoning: req.Reasoning != nil || hasLegacyReasoningRequest(req.Capabilities),
 	}
 }
 

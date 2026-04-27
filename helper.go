@@ -249,7 +249,7 @@ func cloneRequestWithDepth(req *Request, depth cloneDepth) *Request {
 	clone.Tools = cloneTools(req.Tools)
 	clone.Stop = cloneStringSlice(req.Stop)
 	clone.Meta = cloneMap(req.Meta)
-	clone.ExtraBody = cloneMap(req.ExtraBody)
+	clone.Capabilities = cloneMap(req.Capabilities)
 	clone.Temperature = cloneFloat64(req.Temperature)
 	clone.TopP = cloneFloat64(req.TopP)
 	clone.PresencePenalty = cloneFloat64(req.PresencePenalty)
@@ -267,7 +267,7 @@ func cloneResponseRequest(req *ResponseRequest) *ResponseRequest {
 	clone := *req
 	clone.Input = cloneResponseInputItems(req.Input)
 	clone.Tools = cloneResponseTools(req.Tools)
-	clone.ExtraBody = cloneMap(req.ExtraBody)
+	clone.Capabilities = cloneMap(req.Capabilities)
 	clone.Reasoning = cloneReasoningOptions(req.Reasoning)
 
 	return &clone
@@ -517,4 +517,62 @@ func convertResponseInputItems(items []ResponseInputItem) []map[string]any {
 		input = append(input, entry)
 	}
 	return input
+}
+
+// ============================================================================
+// Codec Helper Functions
+// ============================================================================
+// These functions are used by all protocol codecs to build request bodies.
+// They provide a consistent pattern for conditionally adding fields to
+// protocol-specific request maps.
+
+// putFloat64PtrField adds a float64 pointer field to the request map if not nil.
+func putFloat64PtrField(dst map[string]any, key string, value *float64) {
+	if value != nil {
+		dst[key] = *value
+	}
+}
+
+// putStringField adds a string field to the request map if not empty.
+func putStringField(dst map[string]any, key, value string) {
+	if value != "" {
+		dst[key] = value
+	}
+}
+
+// putPositiveIntField adds an int field to the request map if greater than 0.
+func putPositiveIntField(dst map[string]any, key string, value int) {
+	if value > 0 {
+		dst[key] = value
+	}
+}
+
+// putSliceField adds a slice field to the request map if not empty.
+func putSliceField[T any](dst map[string]any, key string, value []T) {
+	if len(value) > 0 {
+		dst[key] = value
+	}
+}
+
+// putAnyField adds any field to the request map if not nil.
+func putAnyField(dst map[string]any, key string, value any) {
+	if value != nil {
+		dst[key] = value
+	}
+}
+
+// mergeFields merges extra fields into the destination map.
+func mergeFields(dst map[string]any, extra map[string]any) {
+	for key, value := range extra {
+		dst[key] = value
+	}
+}
+
+// toMap converts a value to a map[string]interface{}, returning empty map if conversion fails.
+func toMap(v any) map[string]interface{} {
+	m, ok := v.(map[string]interface{})
+	if ok {
+		return m
+	}
+	return make(map[string]interface{})
 }
