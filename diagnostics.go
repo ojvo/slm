@@ -66,23 +66,47 @@ func RequestDiagnosticFields(req *Request) []any {
 	}
 }
 
-// ResponseRequestDiagnosticFields returns reusable key/value pairs describing a responses request shape.
+// ResponseRequestDiagnosticFields returns reusable key/value pairs describing a /responses request shape.
 func ResponseRequestDiagnosticFields(req *ResponseRequest) []any {
 	if req == nil {
 		return []any{"request_nil", true}
 	}
+	visionParts := 0
+	for _, item := range req.Input {
+		if parts, ok := item.Content.([]ResponseInputContentPart); ok {
+			for _, p := range parts {
+				if _, isImg := p.(ResponseInputImagePart); isImg {
+					visionParts++
+				}
+			}
+		}
+	}
 	reasoning := ""
+	reasoningSummary := ""
 	if req.Reasoning != nil {
 		reasoning = req.Reasoning.Effort
+		reasoningSummary = req.Reasoning.Summary
 	}
 	return []any{
 		"model", req.Model,
 		"stream", req.Stream,
 		"input_items", len(req.Input),
+		"vision_parts", visionParts,
 		"tools", len(req.Tools),
 		"reasoning", reasoning,
+		"reasoning_summary", reasoningSummary,
 		"max_output_tokens", req.MaxOutputTokens,
 		"store", req.Store,
 		"extra_body_keys", len(req.ExtraBody),
 	}
+}
+
+// eventDiagnosticFields returns diagnostic fields for a LifecycleEvent,
+// automatically selecting the correct diagnostic function based on which
+// request type is populated.
+func eventDiagnosticFields(event LifecycleEvent) []any {
+	if event.ResponseRequest != nil {
+		return ResponseRequestDiagnosticFields(event.ResponseRequest)
+	}
+	return RequestDiagnosticFields(event.Request)
 }

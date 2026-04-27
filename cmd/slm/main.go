@@ -18,16 +18,14 @@ import (
 	"ojv/slm"
 )
 
-// getAPIKey 支持 ProviderConfig.DefaultAPIKey 作为 fallback。
-// 若传入 providerCfg，优先级：环境变量 > providerCfg.DefaultAPIKey > slm.DefaultAPIKey
 func getAPIKey(providerCfg *slm.ProviderConfig) string {
 	if key := os.Getenv("SLM_API_KEY"); key != "" {
 		return key
 	}
-	if providerCfg != nil && providerCfg.DefaultAPIKey != "" {
-		return providerCfg.DefaultAPIKey
+	if providerCfg != nil && providerCfg.APIKey != "" {
+		return providerCfg.APIKey
 	}
-	return slm.DefaultAPIKey
+	return ""
 }
 func main() {
 	example := flag.String("example", "basic", "Available examples:\n\n"+
@@ -60,7 +58,7 @@ func main() {
 		"    simple_call    SimpleCall/Chat convenience wrappers\n"+
 		"    full_text      FullText() for reasoning models\n\n"+
 		"  07-INFRASTRUCTURE (基础设施)\n"+
-		"    logging        Logger interface + LoggingMiddleware\n"+
+		"    logging        Logger interface + LogObserver\n"+
 		"    timeout        TimeoutMiddleware for request control\n"+
 		"    request_id     RequestIDMiddleware for tracing\n\n"+
 		"  all             Run all examples sequentially\n")
@@ -75,18 +73,14 @@ func main() {
 	var providerCfg slm.ProviderConfig
 	if data, err := ioutil.ReadFile(configPath); err == nil {
 		var cfg struct {
-			Endpoint      string `json:"endpoint"`
-			DefaultModel  string `json:"default_model"`
-			DefaultAPIKey string `json:"default_api_key"`
-			APIKey        string `json:"api_key"`
+			Endpoint     string `json:"endpoint"`
+			DefaultModel string `json:"default_model"`
+			APIKey       string `json:"api_key"`
 		}
 		if err := json.Unmarshal(data, &cfg); err == nil {
 			providerCfg.Endpoint = cfg.Endpoint
 			providerCfg.DefaultModel = cfg.DefaultModel
-			providerCfg.DefaultAPIKey = cfg.DefaultAPIKey
-			if cfg.APIKey != "" {
-				providerCfg.DefaultAPIKey = cfg.APIKey
-			}
+			providerCfg.APIKey = cfg.APIKey
 		}
 	}
 	if providerCfg.Endpoint == "" {
@@ -392,48 +386,118 @@ func runResponses(ctx context.Context, providerCfg *slm.ProviderConfig) {
 	fmt.Println("  RESPONSES: OpenAI Responses API")
 	fmt.Println("========================================")
 
-	engine := slm.NewOpenAIResponsesProtocolWithOptions(
+	baseEngine := slm.NewOpenAIResponsesProtocol(
 		providerCfg.Endpoint,
 		getAPIKey(providerCfg),
-		slm.OpenAIResponsesOptions{
-			DefaultModel: "gpt-4o-mini",
-			Capabilities: &slm.CapabilityNegotiationOptions{
-				Resolver: slm.StaticCapabilityResolver{
-					"gpt-4o-mini": {
-						Supports: slm.CapabilitySet{JSONMode: true, ToolCalls: true, Reasoning: true},
-					},
-				},
-				DefaultModel: "gpt-4o-mini",
-				RequireKnown: true,
-			},
-		},
+		"gpt-4o-mini",
 	)
 
+	engine := slm.ApplyStandardResponseMiddleware(baseEngine, slm.StandardMiddlewareOptions{
+		DefaultModel: "gpt-4o-mini",
+		CrossCutting: slm.CrossCuttingMiddlewareOptions{
+			Timeout: 30 * time.Second,
+		},
+	})
+
+	tool := slm.NewResponseFunctionTool(slm.Tool{
+		Name:        "classify_topic",
+		Description: "Classify a short passage into one topic label",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"text": map[string]any{"type": "string"},
+			},
+			"required": []string{"text"},
+		},
+	})
+
+	fmt.Println("--- Scenario 1: Unary create + structured ResponseTool ---")
 	resp, err := engine.Create(ctx, &slm.ResponseRequest{
 		Input: []slm.ResponseInputItem{{
 			Role:    "user",
 			Content: "Return compact JSON with keys summary and use_case for Go interfaces.",
 		}},
-		Reasoning: &slm.ResponseReasoning{Effort: "medium"},
+		Reasoning: &slm.ResponseReasoning{Effort: "medium", Summary: "auto"},
+		Tools:     []slm.ResponseTool{tool},
 	})
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
 	}
+	printResponsesResult(resp)
 
+	fmt.Println("\n--- Scenario 2: Multipart input item (typed parts) ---")
+	multipartReq := &slm.ResponseRequest{
+		Input: []slm.ResponseInputItem{
+			slm.NewMultiPartResponseInputItem("user", []slm.ResponseInputContentPart{
+				slm.ResponseInputTextPart{Type: "input_text", Text: "Summarize this sentence in 8 words."},
+				slm.ResponseInputTextPart{Type: "input_text", Text: "Go interfaces enable decoupled behavior via contracts."},
+			}),
+		},
+	}
+	resp2, err := engine.Create(ctx, multipartReq)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	printResponsesResult(resp2)
+
+	fmt.Println("\n--- Scenario 3: Stream + ResponseEvent helpers ---")
+	stream, err := engine.Stream(ctx, &slm.ResponseRequest{
+		Input: []slm.ResponseInputItem{{
+			Role:    "user",
+			Content: "List three practical uses of Go interfaces as bullet points.",
+		}},
+		Reasoning: &slm.ResponseReasoning{Effort: "medium", Summary: "auto"},
+		Stream:    true,
+	})
+	if err != nil {
+		fmt.Printf("Stream create error: %v\n", err)
+		return
+	}
+	defer stream.Close()
+
+	fmt.Print("Delta: ")
+	var completed *slm.ResponseObject
+	for stream.Next() {
+		event := stream.Current()
+		if event.IsOutputTextDelta() && event.Delta != "" {
+			fmt.Print(event.Delta)
+		}
+		if c := event.CompletedResponse(); c != nil {
+			completed = c
+		}
+	}
+	fmt.Println()
+	if err := stream.Err(); err != nil {
+		fmt.Printf("Stream error: %v\n", err)
+		return
+	}
+	if completed != nil {
+		fmt.Printf("Completed event received: status=%s outputs=%d\n", completed.Status, len(completed.Output))
+	}
+
+	fmt.Println("✓ /responses now covers unary, multipart input, structured tools, and streaming helpers")
+}
+
+func printResponsesResult(resp *slm.ResponseObject) {
 	fmt.Printf("Status: %s\n", resp.Status)
 	fmt.Printf("Model: %s\n", resp.Model)
 	for _, item := range resp.Output {
 		for _, content := range item.Content {
-			if content.Text != "" {
-				fmt.Printf("Output: %s\n", content.Text)
+			if text := strings.TrimSpace(content.Text); text != "" {
+				fmt.Printf("Output: %s\n", text)
+			}
+		}
+		for _, summary := range item.Summary {
+			if text := strings.TrimSpace(summary.Text); text != "" {
+				fmt.Printf("Summary: %s\n", text)
 			}
 		}
 	}
 	if resp.Usage != nil {
 		fmt.Printf("Usage: input=%d output=%d total=%d\n", resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.Usage.TotalTokens)
 	}
-	fmt.Println("✓ /responses now demonstrates the same explicit capability negotiation entry as chat")
 }
 
 func runToolCalling(ctx context.Context, engine slm.Engine) {
@@ -627,15 +691,13 @@ func runMiddleware(engine slm.Engine) {
 		Backoff:     func(attempt int) time.Duration { return time.Duration(1<<uint(attempt)) * 150 * time.Millisecond },
 	})
 
-	rateLimit, rateLimitCloser := slm.RateLimitMiddleware(5, 3)
+	rateLimit, rateLimitStream, rateLimitCloser := slm.RateLimitMiddlewares(5, 3)
 	defer rateLimitCloser()
 
-	rateLimitStream, rateLimitStreamCloser := slm.RateLimitStreamMiddleware(5, 3)
-	defer rateLimitStreamCloser()
-
-	wrapped := slm.ChainWithStream(engine,
+	wrapped := slm.ChainWithStreamAndClosers(engine,
 		[]slm.Middleware{rateLimit, retryUnary},
 		[]slm.StreamMiddleware{rateLimitStream, retryStream},
+		nil,
 	)
 
 	fmt.Println("Chain: Request → [RateLimit(5 QPS)] → [Retry(3x)] → Engine")
@@ -788,9 +850,11 @@ func runConfig() {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	fmt.Printf("Config:\n%s\n", string(data))
 
-	engine, err := cfg.BuildEngine(func(p slm.ProviderConfig) (slm.Engine, error) {
-		return slm.NewOpenAIProtocol(p.Endpoint, getAPIKey(&p), p.DefaultModel), nil
-	})
+	engine, err := cfg.WithProvider(slm.ProviderConfig{
+		Endpoint:     "https://models.inference.ai.azure.com",
+		DefaultModel: "gpt-4o-mini",
+		APIKey:       getAPIKey(nil),
+	}).BuildEngineWithTransport()
 	if err != nil {
 		fmt.Printf("Build failed: %v\n", err)
 		return
@@ -1541,9 +1605,9 @@ func runLogging(ctx context.Context, engine slm.Engine) {
 
 	logger := &MyLogger{prefix: "LLM"}
 
-	loggingMW := slm.LoggingMiddleware(logger)
-
-	wrapped := slm.Chain(engine, loggingMW)
+	wrapped := slm.ApplyStandardMiddleware(engine, slm.StandardMiddlewareOptions{
+		Observers: []slm.LifecycleObserver{slm.NewLogObserver(logger)},
+	})
 
 	fmt.Println("--- Request with automatic logging ---")
 
@@ -1573,7 +1637,7 @@ func runTimeout(ctx context.Context, engine slm.Engine) {
 
 	timeoutMW := slm.TimeoutMiddleware(5 * time.Second)
 
-	wrapped := slm.Chain(engine, timeoutMW)
+	wrapped := slm.ChainWithStreamAndClosers(engine, []slm.Middleware{timeoutMW}, nil, nil)
 
 	tests := []struct {
 		name   string
@@ -1634,7 +1698,7 @@ func runRequestID(ctx context.Context, engine slm.Engine) {
 
 	requestIDMW := slm.RequestIDMiddleware(nil)
 
-	wrapped := slm.Chain(engine, requestIDMW)
+	wrapped := slm.ChainWithStreamAndClosers(engine, []slm.Middleware{requestIDMW}, nil, nil)
 
 	prompts := []string{
 		"What is 2+2?",

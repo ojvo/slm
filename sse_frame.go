@@ -7,6 +7,8 @@ import (
 	"io"
 )
 
+const maxDataBufferSize = 10 * 1024 * 1024
+
 type sseFrame struct {
 	Event string
 	Data  []byte
@@ -90,6 +92,29 @@ func (r *sseFrameReader) processLine(line []byte) (bool, error) {
 		r.dataBuffer.Write(data)
 	}
 	return false, nil
+}
+
+type sseFrameResult struct {
+	Frame sseFrame
+	Done  bool
+	Err   error
+}
+
+func consumeSSEFrame(framer *sseFrameReader) sseFrameResult {
+	frame, ok, err := framer.Next()
+	if err != nil {
+		if err == io.EOF {
+			return sseFrameResult{Done: true}
+		}
+		return sseFrameResult{Err: err}
+	}
+	if !ok {
+		return sseFrameResult{Done: true}
+	}
+	if frame.Done {
+		return sseFrameResult{Done: true}
+	}
+	return sseFrameResult{Frame: frame}
 }
 
 func (r *sseFrameReader) dispatch() sseFrame {

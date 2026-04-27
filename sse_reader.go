@@ -6,8 +6,6 @@ import (
 	"sync"
 )
 
-const maxDataBufferSize = 10 * 1024 * 1024 // 10MB
-
 // StreamParser is a function that parses a single SSE data line into a Response
 type StreamParser func(event string, data []byte) (*Response, bool, error)
 
@@ -43,27 +41,17 @@ func (r *SSEReader) Next() bool {
 	}
 
 	for {
-		frame, ok, err := r.framer.Next()
-		if err != nil {
-			if err == io.EOF {
-				r.done = true
-				r.Close()
-				return false
-			}
-			r.err = WrapOperationalError("stream read error", err)
-			return false
-		}
-		if !ok {
+		result := consumeSSEFrame(r.framer)
+		if result.Done {
 			r.done = true
 			r.Close()
 			return false
 		}
-		if frame.Done {
-			r.done = true
-			r.Close()
+		if result.Err != nil {
+			r.err = WrapOperationalError("stream read error", result.Err)
 			return false
 		}
-		yield, stop := r.dispatch(frame)
+		yield, stop := r.dispatch(result.Frame)
 		if stop {
 			return yield
 		}

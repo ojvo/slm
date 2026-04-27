@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const maxResponseSize = 50 * 1024 * 1024
+
 const maxHTTPErrorBodySize = 2048
 
 // NewTextMessage 创建文本消息
@@ -55,47 +57,60 @@ func NewImageMessage(imageURL string) Message {
 //	req.TopP = slm.Float64(0.9)
 func Float64(v float64) *float64 { return &v }
 
-func cloneResponseRequest(req *ResponseRequest) *ResponseRequest {
-	if req == nil {
-		return nil
-	}
-	clone := *req
-	clone.Input = append([]ResponseInputItem(nil), req.Input...)
-	clone.Tools = append([]json.RawMessage(nil), req.Tools...)
-	if req.ExtraBody != nil {
-		clone.ExtraBody = make(map[string]any, len(req.ExtraBody))
-		for key, value := range req.ExtraBody {
-			clone.ExtraBody[key] = value
-		}
-	}
-	if req.Reasoning != nil {
-		reasoning := *req.Reasoning
-		clone.Reasoning = &reasoning
-	}
-	return &clone
+func normalizeRequestForOperation(req *Request, defaultModel string, stream bool) *Request {
+	return normalizeForOperation(req, defaultModel, stream,
+		func(r *Request) string { return r.Model },
+		func(r *Request) bool { return r.Stream },
+		func(r *Request, s bool, m string) *Request {
+			clone := cloneRequestShallow(r)
+			clone.Stream = s
+			if r.Model == "" {
+				clone.Model = m
+			}
+			return clone
+		},
+	)
 }
 
 func normalizeResponseRequestForOperation(req *ResponseRequest, defaultModel string, stream bool) *ResponseRequest {
-	if req == nil {
+	return normalizeForOperation(req, defaultModel, stream,
+		func(r *ResponseRequest) string { return r.Model },
+		func(r *ResponseRequest) bool { return r.Stream },
+		func(r *ResponseRequest, s bool, m string) *ResponseRequest {
+			clone := cloneResponseRequest(r)
+			clone.Stream = s
+			if r.Model == "" {
+				clone.Model = m
+			}
+			return clone
+		},
+	)
+}
+
+func normalizeCompletedResponseObject(resp *ResponseObject) *ResponseObject {
+	if resp == nil {
 		return nil
 	}
-
-	model := strings.TrimSpace(req.Model)
-	resolvedModel := model
-	if resolvedModel == "" {
-		resolvedModel = strings.TrimSpace(defaultModel)
+	if resp.Status == "completed" && resp.Output == nil {
+		resp.Output = []ResponseOutput{}
 	}
+	return resp
+}
 
-	if req.Stream == stream && model == resolvedModel {
+func normalizeForOperation[T any](req T, defaultModel string, stream bool,
+	getModel func(T) string,
+	getStream func(T) bool,
+	cloneAndAssign func(T, bool, string) T,
+) T {
+	var zero T
+	if any(req) == nil {
+		return zero
+	}
+	resolved := resolveRequestedModel(getModel(req), defaultModel)
+	if getStream(req) == stream && getModel(req) == resolved {
 		return req
 	}
-
-	clone := cloneResponseRequest(req)
-	clone.Stream = stream
-	if model == "" {
-		clone.Model = resolvedModel
-	}
-	return clone
+	return cloneAndAssign(req, stream, resolved)
 }
 
 func unixFloatToTime(value float64) time.Time {
@@ -148,11 +163,11 @@ func decodeJSONResponse(resp *http.Response, out any) error {
 	return nil
 }
 
-func defaultResponseString(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
+func defaultString(value, fallback string) string {
+	if value != "" {
+		return value
 	}
-	return value
+	return fallback
 }
 
 // -----------------------------------------------------------------------------
@@ -193,4 +208,313 @@ func classifyHTTPError(statusCode int, body []byte) ErrorCode {
 		}
 		return ErrCodeInternal
 	}
+}
+
+type cloneDepth int
+
+const (
+	cloneDepthShallow cloneDepth = iota
+	cloneDepthMetadata
+	cloneDepthDeep
+)
+
+func cloneRequest(req *Request) *Request {
+	return cloneRequestWithDepth(req, cloneDepthDeep)
+}
+
+func cloneRequestShallow(req *Request) *Request {
+	return cloneRequestWithDepth(req, cloneDepthShallow)
+}
+
+func cloneRequestForMetadata(req *Request) *Request {
+	return cloneRequestWithDepth(req, cloneDepthMetadata)
+}
+
+func cloneRequestWithDepth(req *Request, depth cloneDepth) *Request {
+	if req == nil {
+		return nil
+	}
+
+	clone := *req
+	if depth == cloneDepthShallow {
+		return &clone
+	}
+
+	if depth == cloneDepthMetadata {
+		clone.Meta = cloneMap(clone.Meta)
+		return &clone
+	}
+
+	clone.Messages = cloneMessages(req.Messages)
+	clone.Tools = cloneTools(req.Tools)
+	clone.Stop = cloneStringSlice(req.Stop)
+	clone.Meta = cloneMap(req.Meta)
+	clone.ExtraBody = cloneMap(req.ExtraBody)
+	clone.Temperature = cloneFloat64(req.Temperature)
+	clone.TopP = cloneFloat64(req.TopP)
+	clone.PresencePenalty = cloneFloat64(req.PresencePenalty)
+	clone.FrequencyPenalty = cloneFloat64(req.FrequencyPenalty)
+	clone.Reasoning = cloneReasoningOptions(req.Reasoning)
+
+	return &clone
+}
+
+func cloneResponseRequest(req *ResponseRequest) *ResponseRequest {
+	if req == nil {
+		return nil
+	}
+
+	clone := *req
+	clone.Input = cloneResponseInputItems(req.Input)
+	clone.Tools = cloneResponseTools(req.Tools)
+	clone.ExtraBody = cloneMap(req.ExtraBody)
+	clone.Reasoning = cloneReasoningOptions(req.Reasoning)
+
+	return &clone
+}
+
+func cloneMessages(messages []Message) []Message {
+	if messages == nil {
+		return nil
+	}
+
+	cloned := make([]Message, len(messages))
+	for i, msg := range messages {
+		cloned[i] = Message{
+			Role:       msg.Role,
+			Content:    append([]ContentPart(nil), msg.Content...),
+			Name:       msg.Name,
+			ToolCalls:  append([]APIToolCall(nil), msg.ToolCalls...),
+			ToolCallID: msg.ToolCallID,
+		}
+	}
+
+	return cloned
+}
+
+func cloneTools(tools []Tool) []Tool {
+	if tools == nil {
+		return nil
+	}
+
+	cloned := make([]Tool, len(tools))
+	copy(cloned, tools)
+	return cloned
+}
+
+func cloneResponseInputItems(items []ResponseInputItem) []ResponseInputItem {
+	if items == nil {
+		return nil
+	}
+
+	cloned := make([]ResponseInputItem, len(items))
+	for i, item := range items {
+		cloned[i] = ResponseInputItem{
+			Role:    item.Role,
+			Content: cloneResponseInputContent(item.Content),
+		}
+	}
+	return cloned
+}
+
+func cloneResponseInputContent(content any) any {
+	switch c := content.(type) {
+	case nil:
+		return nil
+	case string:
+		return c
+	case []ResponseInputContentPart:
+		parts := make([]ResponseInputContentPart, len(c))
+		copy(parts, c)
+		return parts
+	default:
+		return c
+	}
+}
+
+func cloneResponseTools(tools []ResponseTool) []ResponseTool {
+	if tools == nil {
+		return nil
+	}
+	out := make([]ResponseTool, len(tools))
+	copy(out, tools)
+	return out
+}
+
+// cloneReasoningOptions clones a ReasoningOptions (and by alias ResponseReasoning) value.
+func cloneReasoningOptions(reasoning *ReasoningOptions) *ReasoningOptions {
+	if reasoning == nil {
+		return nil
+	}
+	clone := *reasoning
+	return &clone
+}
+
+func cloneFloat64(p *float64) *float64 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func cloneMap(m map[string]any) map[string]any {
+	if len(m) == 0 {
+		return nil
+	}
+	cp := make(map[string]any, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+func cloneStringSlice(s []string) []string {
+	if s == nil {
+		return nil
+	}
+	cp := make([]string, len(s))
+	copy(cp, s)
+	return cp
+}
+
+//
+
+func extractResponseText(content any) string {
+	switch value := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	case []any:
+		var builder strings.Builder
+		for _, item := range value {
+			part, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			partType, _ := part["type"].(string)
+			switch partType {
+			case "", "text", "output_text":
+				if text, ok := part["text"].(string); ok {
+					builder.WriteString(text)
+				}
+			}
+		}
+		return builder.String()
+	default:
+		return ""
+	}
+}
+
+func buildImageContent(p ImagePart) map[string]any {
+	if p.URL == "" && p.Base64 == "" {
+		return nil
+	}
+	img := map[string]any{"type": "image_url"}
+	imageURL := map[string]any{}
+	if p.URL != "" {
+		imageURL["url"] = p.URL
+	} else {
+		mime := p.MIME
+		if mime == "" {
+			mime = "image/png"
+		}
+		imageURL["url"] = "data:" + mime + ";base64," + p.Base64
+	}
+	if p.Detail != "" {
+		imageURL["detail"] = p.Detail
+	}
+	img["image_url"] = imageURL
+	return img
+}
+
+func convertMessages(messages []Message) []oaiMessage {
+	result := make([]oaiMessage, len(messages))
+	for i, msg := range messages {
+		oaiMsg := oaiMessage{Role: string(msg.Role), Name: msg.Name, ToolCallID: msg.ToolCallID}
+
+		switch len(msg.Content) {
+		case 0:
+			oaiMsg.Content = nil
+		case 1:
+			switch p := msg.Content[0].(type) {
+			case TextPart:
+				oaiMsg.Content = string(p)
+			case ImagePart:
+				if img := buildImageContent(p); img != nil {
+					oaiMsg.Content = []map[string]any{img}
+				}
+			}
+		default:
+			var parts []map[string]any
+			for _, part := range msg.Content {
+				switch p := part.(type) {
+				case TextPart:
+					parts = append(parts, map[string]any{"type": "text", "text": string(p)})
+				case ImagePart:
+					if img := buildImageContent(p); img != nil {
+						parts = append(parts, img)
+					}
+				}
+			}
+			if len(parts) > 0 {
+				oaiMsg.Content = parts
+			}
+		}
+
+		if len(msg.ToolCalls) > 0 {
+			oaiMsg.ToolCalls = make([]oaiToolCall, len(msg.ToolCalls))
+			for k, tc := range msg.ToolCalls {
+				oaiMsg.ToolCalls[k] = oaiToolCall{
+					Index: k,
+					ID:    tc.ID,
+					Type:  tc.Type,
+					Function: struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}{Name: tc.Name, Arguments: tc.Arguments},
+				}
+			}
+		}
+
+		result[i] = oaiMsg
+	}
+	return result
+}
+
+func convertTools(tools []Tool) []oaiTool {
+	result := make([]oaiTool, len(tools))
+	for i, t := range tools {
+		result[i] = oaiTool{
+			Type: "function",
+			Function: oaiFunction{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.Parameters,
+			},
+		}
+	}
+	return result
+}
+
+func convertResponseInputItems(items []ResponseInputItem) []map[string]any {
+	input := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		entry := map[string]any{"role": item.Role}
+		switch v := item.Content.(type) {
+		case string:
+			entry["content"] = v
+		case []ResponseInputContentPart:
+			parts := make([]any, 0, len(v))
+			for _, p := range v {
+				parts = append(parts, p)
+			}
+			entry["content"] = parts
+		default:
+			entry["content"] = v
+		}
+		input = append(input, entry)
+	}
+	return input
 }

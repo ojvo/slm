@@ -121,74 +121,6 @@ func StreamCallFull[T any](ctx context.Context, engine Engine, req *Request) (*S
 	}, nil
 }
 
-func cloneRequest(req *Request) *Request {
-	if req == nil {
-		return nil
-	}
-
-	clone := *req
-
-	msgs := make([]Message, len(req.Messages))
-	for i, msg := range req.Messages {
-		msgs[i] = Message{
-			Role:       msg.Role,
-			Content:    append([]ContentPart(nil), msg.Content...),
-			Name:       msg.Name,
-			ToolCalls:  append([]APIToolCall(nil), msg.ToolCalls...),
-			ToolCallID: msg.ToolCallID,
-		}
-	}
-	tools := make([]Tool, len(req.Tools))
-	copy(tools, req.Tools)
-
-	clone.Messages = msgs
-	clone.Tools = tools
-	clone.Stop = append([]string(nil), req.Stop...)
-	clone.Meta = shallowCopyMap(req.Meta)
-	clone.ExtraBody = shallowCopyMap(req.ExtraBody)
-	clone.Temperature = cloneFloat64Ptr(req.Temperature)
-	clone.TopP = cloneFloat64Ptr(req.TopP)
-	clone.PresencePenalty = cloneFloat64Ptr(req.PresencePenalty)
-	clone.FrequencyPenalty = cloneFloat64Ptr(req.FrequencyPenalty)
-	clone.Reasoning = cloneReasoningOptions(req.Reasoning)
-
-	return &clone
-}
-
-func cloneRequestShallow(req *Request) *Request {
-	if req == nil {
-		return nil
-	}
-	clone := *req
-	return &clone
-}
-
-func cloneRequestForMetadata(req *Request) *Request {
-	clone := cloneRequestShallow(req)
-	if clone == nil {
-		clone = &Request{}
-	}
-	clone.Meta = shallowCopyMap(clone.Meta)
-	return clone
-}
-
-func cloneRequestForRetry(req *Request) *Request {
-	clone := cloneRequestShallow(req)
-	if clone == nil {
-		return nil
-	}
-	clone.Meta = shallowCopyMap(clone.Meta)
-	return clone
-}
-
-func cloneReasoningOptions(reasoning *ReasoningOptions) *ReasoningOptions {
-	if reasoning == nil {
-		return nil
-	}
-	clone := *reasoning
-	return &clone
-}
-
 // SimpleCall 简单文本调用
 func SimpleCall(ctx context.Context, engine Engine, prompt string) (string, error) {
 	resp, err := engine.Generate(ctx, &Request{
@@ -275,25 +207,6 @@ func extractBalanced(s string, open, close byte) string {
 		}
 	}
 	return s
-}
-
-func shallowCopyMap(in map[string]any) map[string]any {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-func cloneFloat64Ptr(p *float64) *float64 {
-	if p == nil {
-		return nil
-	}
-	v := *p
-	return &v
 }
 
 type toolCallAccum struct {

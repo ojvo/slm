@@ -11,148 +11,35 @@ import (
 	"time"
 )
 
-// RateLimitConfig defines rate limit settings for standard middleware chains.
-type RateLimitConfig struct {
-	Limit float64
-	Burst int
+// -----------------------------------------------------------------------------
+// Pipeline Core Types
+// -----------------------------------------------------------------------------
+
+type PipelineHandler[Req any, Resp any] func(ctx context.Context, req Req) (Resp, error)
+type PipelineStreamHandler[Req any, StreamResp any] func(ctx context.Context, req Req) (StreamResp, error)
+type PipelineMiddleware[Req any, Resp any] func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp]
+type PipelineStreamMiddleware[Req any, StreamResp any] func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp]
+
+type PipelineEngine[Req any, Resp any, StreamResp any] interface {
+	Generate(ctx context.Context, req Req) (Resp, error)
+	Stream(ctx context.Context, req Req) (StreamResp, error)
 }
 
-// StandardMiddlewareOptions defines the recommended default middleware stack.
-//
-// Middleware order is fixed as:
-// request id -> request normalization -> capability negotiation -> lifecycle observers -> timeout -> retry -> rate limit -> engine
-//
-// This bounds total request time, applies retries within the timeout window,
-// and charges rate limits per
-// underlying attempt rather than per logical request.
-type StandardMiddlewareOptions struct {
-	DefaultModel       string
-	Capabilities       *CapabilityNegotiationOptions
-	Observers          []LifecycleObserver
-	Retry              *RetryConfig
-	Timeout            time.Duration
-	EnableRequestID    bool
-	RequestIDGenerator func() string
-	RateLimit          *RateLimitConfig
-}
+type PipelineCloser interface{ Close() }
 
-// Middleware 普通中间件定义
-type Middleware func(next Handler) Handler
-
-// StreamHandler 流式处理函数定义
-type StreamHandler func(ctx context.Context, req *Request) (StreamIterator, error)
-
-// StreamMiddleware 流式中间件定义
-type StreamMiddleware func(next StreamHandler) StreamHandler
-
-// Chain 创建带中间件的引擎链
-func Chain(engine Engine, middlewares ...Middleware) Engine {
-	return &middlewareEngine{
-		inner:       engine,
-		middlewares: middlewares,
-	}
-}
-
-// ChainWithStream 创建同时支持普通和流式中间件的引擎链
-func ChainWithStream(engine Engine, middlewares []Middleware, streamMiddlewares []StreamMiddleware) Engine {
-	return &middlewareEngine{
-		inner:             engine,
-		middlewares:       middlewares,
-		streamMiddlewares: streamMiddlewares,
-	}
-}
-
-// ChainWithStreamAndClosers 创建同时支持普通和流式中间件的引擎链，并追踪清理函数
-func ChainWithStreamAndClosers(engine Engine, middlewares []Middleware, streamMiddlewares []StreamMiddleware, closers []func()) Engine {
-	return &middlewareEngine{
-		inner:             engine,
-		middlewares:       middlewares,
-		streamMiddlewares: streamMiddlewares,
-		closers:           closers,
-	}
-}
-
-// ApplyStandardMiddleware wraps an engine with the recommended middleware stack.
-func ApplyStandardMiddleware(engine Engine, opts StandardMiddlewareOptions) Engine {
-	var middlewares []Middleware
-	var streamMiddlewares []StreamMiddleware
-	var closers []func()
-
-	if opts.EnableRequestID {
-		middlewares = append(middlewares, RequestIDMiddleware(opts.RequestIDGenerator))
-		streamMiddlewares = append(streamMiddlewares, RequestIDStreamMiddleware(opts.RequestIDGenerator))
-	}
-
-	middlewares = append(middlewares, NormalizeRequestMiddleware(opts.DefaultModel))
-	streamMiddlewares = append(streamMiddlewares, NormalizeRequestStreamMiddleware(opts.DefaultModel))
-
-	if opts.Capabilities != nil && opts.Capabilities.Resolver != nil {
-		capUnary, capStream := CapabilityNegotiationMiddleware(*opts.Capabilities)
-		middlewares = append(middlewares, capUnary)
-		streamMiddlewares = append(streamMiddlewares, capStream)
-	}
-
-	if len(opts.Observers) > 0 {
-		observer := compositeLifecycleObserver{observers: opts.Observers}
-		observerUnary, observerStream := LifecycleObserverMiddleware(observer)
-		middlewares = append(middlewares, observerUnary)
-		streamMiddlewares = append(streamMiddlewares, observerStream)
-	}
-
-	if opts.Timeout > 0 {
-		middlewares = append(middlewares, TimeoutMiddleware(opts.Timeout))
-		streamMiddlewares = append(streamMiddlewares, TimeoutStreamMiddleware(opts.Timeout))
-	}
-
-	if opts.Retry != nil && opts.Retry.MaxAttempts > 1 {
-		retryUnary, retryStream := RetryMiddlewareWithConfig(*opts.Retry)
-		middlewares = append(middlewares, retryUnary)
-		streamMiddlewares = append(streamMiddlewares, retryStream)
-	}
-
-	if opts.RateLimit != nil {
-		rateLimit, rateLimitStream, closer := RateLimitMiddlewares(opts.RateLimit.Limit, opts.RateLimit.Burst)
-		middlewares = append(middlewares, rateLimit)
-		streamMiddlewares = append(streamMiddlewares, rateLimitStream)
-		closers = append(closers, closer)
-	}
-
-	if len(middlewares) == 0 && len(streamMiddlewares) == 0 {
-		return engine
-	}
-
-	return ChainWithStreamAndClosers(engine, middlewares, streamMiddlewares, closers)
-}
-
-// NormalizeRequestMiddleware ensures diagnostics and downstream middleware see
-// the effective request shape for unary operations.
-func NormalizeRequestMiddleware(defaultModel string) Middleware {
-	return func(next Handler) Handler {
-		return func(ctx context.Context, req *Request) (*Response, error) {
-			return next(ctx, normalizeRequestForOperation(req, defaultModel, false))
-		}
-	}
-}
-
-// NormalizeRequestStreamMiddleware ensures diagnostics and downstream middleware
-// see the effective request shape for stream operations.
-func NormalizeRequestStreamMiddleware(defaultModel string) StreamMiddleware {
-	return func(next StreamHandler) StreamHandler {
-		return func(ctx context.Context, req *Request) (StreamIterator, error) {
-			return next(ctx, normalizeRequestForOperation(req, defaultModel, true))
-		}
-	}
-}
-
-type middlewareEngine struct {
-	inner             Engine
-	middlewares       []Middleware
-	streamMiddlewares []StreamMiddleware
+type genericPipelineEngine[Req any, Resp any, StreamResp any] struct {
+	inner             PipelineEngine[Req, Resp, StreamResp]
+	middlewares       []PipelineMiddleware[Req, Resp]
+	streamMiddlewares []PipelineStreamMiddleware[Req, StreamResp]
 	closers           []func()
 	closeOnce         sync.Once
 }
 
-func (m *middlewareEngine) Generate(ctx context.Context, req *Request) (*Response, error) {
+func ChainPipelineWithStreamAndClosers[Req any, Resp any, StreamResp any](engine PipelineEngine[Req, Resp, StreamResp], middlewares []PipelineMiddleware[Req, Resp], streamMiddlewares []PipelineStreamMiddleware[Req, StreamResp], closers []func()) PipelineEngine[Req, Resp, StreamResp] {
+	return &genericPipelineEngine[Req, Resp, StreamResp]{inner: engine, middlewares: middlewares, streamMiddlewares: streamMiddlewares, closers: closers}
+}
+
+func (m *genericPipelineEngine[Req, Resp, StreamResp]) Generate(ctx context.Context, req Req) (Resp, error) {
 	handler := m.inner.Generate
 	for i := len(m.middlewares) - 1; i >= 0; i-- {
 		handler = m.middlewares[i](handler)
@@ -160,7 +47,7 @@ func (m *middlewareEngine) Generate(ctx context.Context, req *Request) (*Respons
 	return handler(ctx, req)
 }
 
-func (m *middlewareEngine) Stream(ctx context.Context, req *Request) (StreamIterator, error) {
+func (m *genericPipelineEngine[Req, Resp, StreamResp]) Stream(ctx context.Context, req Req) (StreamResp, error) {
 	handler := m.inner.Stream
 	for i := len(m.streamMiddlewares) - 1; i >= 0; i-- {
 		handler = m.streamMiddlewares[i](handler)
@@ -168,7 +55,7 @@ func (m *middlewareEngine) Stream(ctx context.Context, req *Request) (StreamIter
 	return handler(ctx, req)
 }
 
-func (m *middlewareEngine) Close() {
+func (m *genericPipelineEngine[Req, Resp, StreamResp]) Close() {
 	m.closeOnce.Do(func() {
 		for _, closer := range m.closers {
 			closer()
@@ -176,51 +63,552 @@ func (m *middlewareEngine) Close() {
 	})
 }
 
-// RateLimitMiddleware 创建速率限制中间件（自动管理资源）
-func RateLimitMiddleware(limit float64, burst int) (Middleware, func()) {
-	limiter := newSimpleLimiter(limit, burst)
-	runtime.SetFinalizer(limiter, func(l *simpleLimiter) { l.Close() })
-	unary, _, closer := rateLimitMiddlewaresFromLimiter(limiter)
-	return unary, closer
+// -----------------------------------------------------------------------------
+// Config Types
+// -----------------------------------------------------------------------------
+
+type RateLimitConfig struct {
+	Limit float64
+	Burst int
 }
 
-// RateLimitMiddlewares creates unary and stream middlewares sharing one limiter.
-func RateLimitMiddlewares(limit float64, burst int) (Middleware, StreamMiddleware, func()) {
-	limiter := newSimpleLimiter(limit, burst)
-	runtime.SetFinalizer(limiter, func(l *simpleLimiter) { l.Close() })
-	return rateLimitMiddlewaresFromLimiter(limiter)
+type CrossCuttingMiddlewareOptions struct {
+	Timeout   time.Duration
+	Retry     *RetryConfig
+	RateLimit *RateLimitConfig
 }
 
-func rateLimitMiddlewaresFromLimiter(limiter *simpleLimiter) (Middleware, StreamMiddleware, func()) {
-	unary := func(next Handler) Handler {
-		return func(ctx context.Context, req *Request) (*Response, error) {
+type StandardMiddlewareOptions struct {
+	DefaultModel       string
+	Capabilities       *CapabilityNegotiationOptions
+	Observers          []LifecycleObserver
+	EnableRequestID    bool
+	RequestIDGenerator func() string
+	CrossCutting       CrossCuttingMiddlewareOptions
+}
+
+type Handler = PipelineHandler[*Request, *Response]
+type StreamHandler = PipelineStreamHandler[*Request, StreamIterator]
+type Middleware = PipelineMiddleware[*Request, *Response]
+type StreamMiddleware = PipelineStreamMiddleware[*Request, StreamIterator]
+
+type ResponseHandler = PipelineHandler[*ResponseRequest, *ResponseObject]
+type ResponseStreamHandler = PipelineStreamHandler[*ResponseRequest, ResponseStream]
+type ResponseMiddleware = PipelineMiddleware[*ResponseRequest, *ResponseObject]
+type ResponseStreamMiddleware = PipelineStreamMiddleware[*ResponseRequest, ResponseStream]
+
+type MiddlewareSuite[Req any, Resp any, StreamResp any] struct {
+	Normalize  func(defaultModel string) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp])
+	RequestID  func(generator func() string) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp])
+	Capability func(opts CapabilityNegotiationOptions) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp])
+	Observer   func(observer LifecycleObserver) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp])
+	Timeout    func(timeout time.Duration) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp])
+	Retry      func(cfg RetryConfig) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp])
+	RateLimit  func(limit float64, burst int) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp], func())
+}
+
+type middlewareSuiteCallbacks[Req any, Resp any, StreamResp any] struct {
+	normalize            func(Req, string, bool) Req
+	setRequestIDMeta     func(Req, string) Req
+	negotiate            func(context.Context, Req, CapabilityNegotiationOptions) (context.Context, Req, error)
+	observerBuilder      eventBuilder[Req, Resp, StreamResp]
+	timeoutErr           string
+	streamTimeoutErr     string
+	streamReadTimeoutErr string
+	streamCanInterrupt   bool
+	cloneForRetry        func(Req) Req
+}
+
+func buildMiddlewareSuite[Req any, Resp any, StreamResp any](cb middlewareSuiteCallbacks[Req, Resp, StreamResp]) MiddlewareSuite[Req, Resp, StreamResp] {
+	return MiddlewareSuite[Req, Resp, StreamResp]{
+		Normalize: func(defaultModel string) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
+			return normalizeMiddleware[Req, Resp, StreamResp](defaultModel, cb.normalize)
+		},
+		RequestID: func(generator func() string) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
+			return requestIDMiddleware[Req, Resp](generator, cb.setRequestIDMeta),
+				requestIDStreamMiddleware[Req, StreamResp](generator, cb.setRequestIDMeta)
+		},
+		Capability: func(opts CapabilityNegotiationOptions) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
+			return capabilityNegotiationMiddleware[Req, Resp, StreamResp](opts, cb.negotiate)
+		},
+		Observer: func(observer LifecycleObserver) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
+			return lifecycleObserverMiddleware(observer, cb.observerBuilder)
+		},
+		Timeout: func(timeout time.Duration) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
+			return timeoutMiddleware[Req, Resp](timeout, cb.timeoutErr),
+				timeoutStreamMiddleware[Req, Resp, StreamResp](timeout, cb.streamTimeoutErr, cb.streamReadTimeoutErr, cb.streamCanInterrupt)
+		},
+		Retry: func(cfg RetryConfig) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
+			return retryMiddlewareWithConfig[Req, Resp, StreamResp](cfg, cb.cloneForRetry)
+		},
+		RateLimit: func(limit float64, burst int) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp], func()) {
+			return rateLimitMiddlewares[Req, Resp, StreamResp](limit, burst)
+		},
+	}
+}
+
+func setRequestMetaForID(req *Request, id string) *Request {
+	cloned := cloneRequestForMetadata(req)
+	if cloned.Meta == nil {
+		cloned.Meta = make(map[string]any)
+	}
+	cloned.Meta["request_id"] = id
+	return cloned
+}
+
+var chatSuite = buildMiddlewareSuite[*Request, *Response, StreamIterator](middlewareSuiteCallbacks[*Request, *Response, StreamIterator]{
+	normalize:            normalizeRequestForOperation,
+	setRequestIDMeta:     setRequestMetaForID,
+	negotiate:            NegotiateRequestCapabilities,
+	observerBuilder:      chatEventBuilder,
+	timeoutErr:           "request timeout",
+	streamTimeoutErr:     "stream request timeout",
+	streamReadTimeoutErr: "stream read timeout",
+	streamCanInterrupt:   true,
+	cloneForRetry: func(req *Request) *Request {
+		return cloneRequestForMetadata(req)
+	},
+})
+
+var responsesSuite = buildMiddlewareSuite[*ResponseRequest, *ResponseObject, ResponseStream](middlewareSuiteCallbacks[*ResponseRequest, *ResponseObject, ResponseStream]{
+	normalize:            normalizeResponseRequestForOperation,
+	setRequestIDMeta:     nil,
+	negotiate:            NegotiateResponseCapabilities,
+	observerBuilder:      responsesEventBuilder,
+	timeoutErr:           "response request timeout",
+	streamTimeoutErr:     "response stream request timeout",
+	streamReadTimeoutErr: "response stream read timeout",
+	streamCanInterrupt:   false,
+	cloneForRetry: func(req *ResponseRequest) *ResponseRequest {
+		return cloneResponseRequest(req)
+	},
+})
+
+func applyStandardMiddleware[Req any, Resp any, StreamResp any](
+	suite MiddlewareSuite[Req, Resp, StreamResp],
+	engine PipelineEngine[Req, Resp, StreamResp],
+	opts StandardMiddlewareOptions,
+) PipelineEngine[Req, Resp, StreamResp] {
+	var middlewares []PipelineMiddleware[Req, Resp]
+	var streamMiddlewares []PipelineStreamMiddleware[Req, StreamResp]
+	var closers []func()
+
+	if opts.EnableRequestID && suite.RequestID != nil {
+		unary, stream := suite.RequestID(opts.RequestIDGenerator)
+		middlewares = append(middlewares, unary)
+		streamMiddlewares = append(streamMiddlewares, stream)
+	}
+
+	if suite.Normalize != nil {
+		unary, stream := suite.Normalize(opts.DefaultModel)
+		middlewares = append(middlewares, unary)
+		streamMiddlewares = append(streamMiddlewares, stream)
+	}
+
+	if opts.Capabilities != nil && opts.Capabilities.Resolver != nil && suite.Capability != nil {
+		unary, stream := suite.Capability(*opts.Capabilities)
+		middlewares = append(middlewares, unary)
+		streamMiddlewares = append(streamMiddlewares, stream)
+	}
+
+	if len(opts.Observers) > 0 && suite.Observer != nil {
+		observer := compositeLifecycleObserver{observers: opts.Observers}
+		unary, stream := suite.Observer(observer)
+		middlewares = append(middlewares, unary)
+		streamMiddlewares = append(streamMiddlewares, stream)
+	}
+
+	if opts.CrossCutting.Timeout > 0 && suite.Timeout != nil {
+		unary, stream := suite.Timeout(opts.CrossCutting.Timeout)
+		middlewares = append(middlewares, unary)
+		streamMiddlewares = append(streamMiddlewares, stream)
+	}
+
+	if opts.CrossCutting.Retry != nil && opts.CrossCutting.Retry.MaxAttempts > 1 && suite.Retry != nil {
+		unary, stream := suite.Retry(*opts.CrossCutting.Retry)
+		middlewares = append(middlewares, unary)
+		streamMiddlewares = append(streamMiddlewares, stream)
+	}
+
+	if opts.CrossCutting.RateLimit != nil && suite.RateLimit != nil {
+		unary, stream, closer := suite.RateLimit(opts.CrossCutting.RateLimit.Limit, opts.CrossCutting.RateLimit.Burst)
+		middlewares = append(middlewares, unary)
+		streamMiddlewares = append(streamMiddlewares, stream)
+		closers = append(closers, closer)
+	}
+
+	if len(middlewares) == 0 && len(streamMiddlewares) == 0 {
+		return engine
+	}
+
+	return ChainPipelineWithStreamAndClosers[Req, Resp, StreamResp](engine, middlewares, streamMiddlewares, closers)
+}
+
+// -----------------------------------------------------------------------------
+// Generic Middleware Factories (unify Chat + Responses)
+// -----------------------------------------------------------------------------
+
+func timeoutMiddleware[Req any, Resp any](timeout time.Duration, errMsg string) PipelineMiddleware[Req, Resp] {
+	return func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp] {
+		return func(ctx context.Context, req Req) (Resp, error) {
+			var zero Resp
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+
+			resp, err := next(ctx, req)
+			if err != nil {
+				if ctx.Err() == context.DeadlineExceeded {
+					return zero, NewLLMError(ErrCodeTimeout, errMsg, ctx.Err())
+				}
+				return zero, err
+			}
+			return resp, nil
+		}
+	}
+}
+
+func rateLimitMiddlewares[Req any, Resp any, StreamResp any](limit float64, burst int) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp], func()) {
+	limiter, closer := newLimiterWithCleanup(limit, burst)
+	unary := func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp] {
+		return func(ctx context.Context, req Req) (Resp, error) {
+			var zero Resp
 			if err := limiter.Wait(ctx); err != nil {
-				return nil, fmt.Errorf("rate limit exceeded: %w", err)
+				return zero, fmt.Errorf("rate limit exceeded: %w", err)
 			}
 			return next(ctx, req)
 		}
 	}
-	stream := func(next StreamHandler) StreamHandler {
-		return func(ctx context.Context, req *Request) (StreamIterator, error) {
+	stream := func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp] {
+		return func(ctx context.Context, req Req) (StreamResp, error) {
+			var zero StreamResp
 			if err := limiter.Wait(ctx); err != nil {
-				return nil, fmt.Errorf("rate limit exceeded: %w", err)
+				return zero, fmt.Errorf("rate limit exceeded: %w", err)
 			}
 			return next(ctx, req)
 		}
 	}
-	closer := func() { limiter.Close() }
 	return unary, stream, closer
 }
 
-// RateLimitStreamMiddleware 创建流式请求的速率限制中间件（自动管理资源）
-func RateLimitStreamMiddleware(limit float64, burst int) (StreamMiddleware, func()) {
-	limiter := newSimpleLimiter(limit, burst)
-	runtime.SetFinalizer(limiter, func(l *simpleLimiter) { l.Close() })
-	_, stream, closer := rateLimitMiddlewaresFromLimiter(limiter)
-	return stream, closer
+func requestIDMiddleware[Req any, Resp any](generator func() string, setMeta func(Req, string) Req) PipelineMiddleware[Req, Resp] {
+	if generator == nil {
+		generator = func() string { return generateRequestID() }
+	}
+	return func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp] {
+		return func(ctx context.Context, req Req) (Resp, error) {
+			reqID := GetRequestID(ctx)
+			if reqID == "" {
+				reqID = generator()
+				ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
+			}
+			if setMeta != nil {
+				req = setMeta(req, reqID)
+			}
+			return next(ctx, req)
+		}
+	}
 }
 
-// simpleLimiter 简单令牌桶限流器
+func requestIDStreamMiddleware[Req any, StreamResp any](generator func() string, setMeta func(Req, string) Req) PipelineStreamMiddleware[Req, StreamResp] {
+	if generator == nil {
+		generator = func() string { return generateRequestID() }
+	}
+	return func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp] {
+		return func(ctx context.Context, req Req) (StreamResp, error) {
+			reqID := GetRequestID(ctx)
+			if reqID == "" {
+				reqID = generator()
+				ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
+			}
+			if setMeta != nil {
+				req = setMeta(req, reqID)
+			}
+			return next(ctx, req)
+		}
+	}
+}
+
+func capabilityNegotiationMiddleware[Req any, Resp any, StreamResp any](
+	opts CapabilityNegotiationOptions,
+	negotiate func(ctx context.Context, req Req, opts CapabilityNegotiationOptions) (context.Context, Req, error),
+) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
+	passUnary := func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp] { return next }
+	passStream := func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp] { return next }
+	if opts.Resolver == nil || negotiate == nil {
+		return passUnary, passStream
+	}
+	unary := func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp] {
+		return func(ctx context.Context, req Req) (Resp, error) {
+			var zero Resp
+			ctx, req, err := negotiate(ctx, req, opts)
+			if err != nil {
+				return zero, err
+			}
+			return next(ctx, req)
+		}
+	}
+	stream := func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp] {
+		return func(ctx context.Context, req Req) (StreamResp, error) {
+			var zero StreamResp
+			ctx, req, err := negotiate(ctx, req, opts)
+			if err != nil {
+				return zero, err
+			}
+			return next(ctx, req)
+		}
+	}
+	return unary, stream
+}
+
+// -----------------------------------------------------------------------------
+// Concrete middleware constructors (public API, delegate to generics)
+// -----------------------------------------------------------------------------
+
+func TimeoutMiddleware(timeout time.Duration) Middleware {
+	return timeoutMiddleware[*Request, *Response](timeout, "request timeout")
+}
+
+func TimeoutStreamMiddleware(timeout time.Duration) StreamMiddleware {
+	return timeoutStreamMiddleware[*Request, *Response, StreamIterator](timeout, "stream request timeout", "stream read timeout", true)
+}
+
+func RateLimitMiddlewares(limit float64, burst int) (Middleware, StreamMiddleware, func()) {
+	return rateLimitMiddlewares[*Request, *Response, StreamIterator](limit, burst)
+}
+
+func RequestIDMiddleware(generator func() string) Middleware {
+	return requestIDMiddleware[*Request, *Response](generator, func(req *Request, id string) *Request {
+		cloned := cloneRequestForMetadata(req)
+		if cloned.Meta == nil {
+			cloned.Meta = make(map[string]any)
+		}
+		cloned.Meta["request_id"] = id
+		return cloned
+	})
+}
+
+func RequestIDStreamMiddleware(generator func() string) StreamMiddleware {
+	inner := requestIDStreamMiddleware[*Request, StreamIterator](generator, func(req *Request, id string) *Request {
+		cloned := cloneRequestForMetadata(req)
+		if cloned.Meta == nil {
+			cloned.Meta = make(map[string]any)
+		}
+		cloned.Meta["request_id"] = id
+		return cloned
+	})
+	return func(next StreamHandler) StreamHandler {
+		wrapped := inner(next)
+		return func(ctx context.Context, req *Request) (StreamIterator, error) {
+			iter, err := wrapped(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			return &requestIDStreamIterator{streamIteratorWrapper: streamIteratorWrapper{inner: iter}, requestID: GetRequestID(ctx)}, nil
+		}
+	}
+}
+
+func ResponseTimeoutMiddleware(timeout time.Duration) ResponseMiddleware {
+	return timeoutMiddleware[*ResponseRequest, *ResponseObject](timeout, "response request timeout")
+}
+
+func ResponseStreamTimeoutMiddleware(timeout time.Duration) ResponseStreamMiddleware {
+	return timeoutStreamMiddleware[*ResponseRequest, *ResponseObject, ResponseStream](timeout, "response stream request timeout", "response stream read timeout", false)
+}
+
+func ResponseRateLimitMiddlewares(limit float64, burst int) (ResponseMiddleware, ResponseStreamMiddleware, func()) {
+	return rateLimitMiddlewares[*ResponseRequest, *ResponseObject, ResponseStream](limit, burst)
+}
+
+func ResponseRequestIDMiddleware(generator func() string) ResponseMiddleware {
+	return requestIDMiddleware[*ResponseRequest, *ResponseObject](generator, nil)
+}
+
+func ResponseRequestIDStreamMiddleware(generator func() string) ResponseStreamMiddleware {
+	return requestIDStreamMiddleware[*ResponseRequest, ResponseStream](generator, nil)
+}
+
+func ResponseCapabilityNegotiationMiddleware(opts CapabilityNegotiationOptions) (ResponseMiddleware, ResponseStreamMiddleware) {
+	return capabilityNegotiationMiddleware[*ResponseRequest, *ResponseObject, ResponseStream](opts, func(ctx context.Context, req *ResponseRequest, o CapabilityNegotiationOptions) (context.Context, *ResponseRequest, error) {
+		return NegotiateResponseCapabilities(ctx, req, o)
+	})
+}
+
+// -----------------------------------------------------------------------------
+// Stream Timeout Middleware (Generic)
+// -----------------------------------------------------------------------------
+
+func timeoutStreamMiddleware[Req any, Resp any, StreamResp any](timeout time.Duration, reqErrMsg, readErrMsg string, canInterrupt bool) PipelineStreamMiddleware[Req, StreamResp] {
+	return func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp] {
+		return func(ctx context.Context, req Req) (StreamResp, error) {
+			var zero StreamResp
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			result, err := next(ctx, req)
+			if err != nil {
+				cancel()
+				if ctx.Err() == context.DeadlineExceeded {
+					return zero, NewLLMError(ErrCodeTimeout, reqErrMsg, ctx.Err())
+				}
+				return zero, err
+			}
+			var onCtxDone func()
+			if canInterrupt {
+				if si, ok := any(result).(InterruptibleStreamIterator); ok {
+					onCtxDone = func() { si.Interrupt(NewLLMError(ErrCodeTimeout, readErrMsg, ctx.Err())) }
+				}
+			}
+			w := wrapTimeoutStream(result, cancel, ctx, readErrMsg, onCtxDone)
+			if wrapped, ok := any(w).(StreamResp); ok {
+				return wrapped, nil
+			}
+			return result, nil
+		}
+	}
+}
+
+func wrapTimeoutStream(inner any, cancel context.CancelFunc, ctx context.Context, errMsg string, onCtxDone func()) any {
+	base := timeoutBaseStream{
+		inner:     asBaseStream(inner),
+		cancel:    cancel,
+		ctx:       ctx,
+		errMsg:    errMsg,
+		onCtxDone: onCtxDone,
+	}
+	switch s := inner.(type) {
+	case StreamIterator:
+		return &timeoutStreamIterator{streamIteratorWrapper: streamIteratorWrapper{inner: s}, base: base}
+	case ResponseStream:
+		return &timeoutResponseStream{responseStreamWrapper: responseStreamWrapper{inner: s}, base: base}
+	}
+	return nil
+}
+
+// -----------------------------------------------------------------------------
+// Timeout Stream Internals
+// -----------------------------------------------------------------------------
+
+type timeoutBaseStream struct {
+	inner      BaseStream
+	cancel     context.CancelFunc
+	ctx        context.Context
+	ctxStopped bool
+	closeOnce  sync.Once
+	closeErr   error
+	errMsg     string
+	onCtxDone  func()
+}
+
+func (t *timeoutBaseStream) Next() bool {
+	if t.ctxStopped {
+		return false
+	}
+	type nextResult struct{ ok bool }
+	resultCh := make(chan nextResult, 1)
+	go func() { resultCh <- nextResult{ok: t.inner.Next()} }()
+	select {
+	case result := <-resultCh:
+		if !result.ok {
+			_ = t.Close()
+		}
+		return result.ok
+	case <-t.ctx.Done():
+		t.ctxStopped = true
+		if t.onCtxDone != nil {
+			t.onCtxDone()
+		}
+		_ = t.Close()
+		return false
+	}
+}
+
+func (t *timeoutBaseStream) Err() error {
+	err := t.inner.Err()
+	if t.ctxStopped {
+		if err != nil {
+			return NewLLMError(ErrCodeTimeout, t.errMsg, err)
+		}
+		return NewLLMError(ErrCodeTimeout, t.errMsg, nil)
+	}
+	if err != nil && t.ctx.Err() == context.DeadlineExceeded {
+		return NewLLMError(ErrCodeTimeout, t.errMsg, err)
+	}
+	return err
+}
+
+func (t *timeoutBaseStream) Close() error {
+	t.closeOnce.Do(func() {
+		t.closeErr = t.inner.Close()
+		t.cancel()
+	})
+	return t.closeErr
+}
+
+type timeoutStreamIterator struct {
+	streamIteratorWrapper
+	base timeoutBaseStream
+}
+
+func (t *timeoutStreamIterator) Next() bool   { return t.base.Next() }
+func (t *timeoutStreamIterator) Err() error   { return t.base.Err() }
+func (t *timeoutStreamIterator) Close() error { return t.base.Close() }
+func (t *timeoutStreamIterator) Interrupt(err error) {
+	t.base.ctxStopped = true
+	interruptStreamIterator(t.inner, err)
+	_ = t.base.Close()
+}
+
+type timeoutResponseStream struct {
+	responseStreamWrapper
+	base timeoutBaseStream
+}
+
+func (t *timeoutResponseStream) Next() bool   { return t.base.Next() }
+func (t *timeoutResponseStream) Err() error   { return t.base.Err() }
+func (t *timeoutResponseStream) Close() error { return t.base.Close() }
+
+// -----------------------------------------------------------------------------
+// RequestID Stream Iterator
+// -----------------------------------------------------------------------------
+
+type requestIDStreamIterator struct {
+	streamIteratorWrapper
+	requestID string
+	closeOnce syncOnceErr
+}
+
+func (r *requestIDStreamIterator) Next() bool {
+	ok := r.inner.Next()
+	if !ok {
+		_ = r.Close()
+	}
+	return ok
+}
+func (r *requestIDStreamIterator) Close() error { return r.closeOnce.Do(r.inner.Close) }
+func (r *requestIDStreamIterator) Interrupt(err error) {
+	interruptStreamIterator(r.inner, err)
+}
+func (r *requestIDStreamIterator) Response() *Response {
+	resp := r.inner.Response()
+	if resp == nil {
+		return nil
+	}
+	if resp.Meta == nil {
+		resp.Meta = make(map[string]any)
+	}
+	resp.Meta["request_id"] = r.requestID
+	return resp
+}
+
+// -----------------------------------------------------------------------------
+// Rate Limiter
+// -----------------------------------------------------------------------------
+
+func newLimiterWithCleanup(limit float64, burst int) (*simpleLimiter, func()) {
+	limiter := newSimpleLimiter(limit, burst)
+	runtime.SetFinalizer(limiter, func(l *simpleLimiter) { l.Close() })
+	return limiter, func() { limiter.Close() }
+}
+
 type simpleLimiter struct {
 	mu     sync.Mutex
 	tokens float64
@@ -251,11 +639,7 @@ func newSimpleLimiter(rate float64, burst int) *simpleLimiter {
 	return s
 }
 
-func (l *simpleLimiter) Close() {
-	l.once.Do(func() {
-		close(l.stop)
-	})
-}
+func (l *simpleLimiter) Close() { l.once.Do(func() { close(l.stop) }) }
 
 func (l *simpleLimiter) refill() {
 	interval := time.Second
@@ -295,7 +679,6 @@ func (l *simpleLimiter) Wait(ctx context.Context) error {
 			return nil
 		}
 		l.mu.Unlock()
-
 		select {
 		case <-l.ch:
 			continue
@@ -307,246 +690,129 @@ func (l *simpleLimiter) Wait(ctx context.Context) error {
 	}
 }
 
-// LoggingMiddleware 创建日志中间件
-func LoggingMiddleware(logger Logger) Middleware {
-	unary, _ := lifecycleObserverMiddlewareWithOwner(NewLogObserver(logger), telemetryOwnerLogging)
+// -----------------------------------------------------------------------------
+// Normalize Middleware
+// -----------------------------------------------------------------------------
+
+func normalizeMiddleware[Req any, Resp any, StreamResp any](defaultModel string, normalize func(Req, string, bool) Req) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
+	unary := func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp] {
+		return func(ctx context.Context, req Req) (Resp, error) {
+			return next(ctx, normalize(req, defaultModel, false))
+		}
+	}
+	stream := func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp] {
+		return func(ctx context.Context, req Req) (StreamResp, error) {
+			return next(ctx, normalize(req, defaultModel, true))
+		}
+	}
+	return unary, stream
+}
+
+func NormalizeRequestMiddleware(defaultModel string) Middleware {
+	unary, _ := normalizeMiddleware[*Request, *Response, StreamIterator](defaultModel, normalizeRequestForOperation)
 	return unary
 }
 
-// LoggingStreamMiddleware 创建流式日志中间件
-func LoggingStreamMiddleware(logger Logger) StreamMiddleware {
-	_, stream := lifecycleObserverMiddlewareWithOwner(NewLogObserver(logger), telemetryOwnerLogging)
+func NormalizeRequestStreamMiddleware(defaultModel string) StreamMiddleware {
+	_, stream := normalizeMiddleware[*Request, *Response, StreamIterator](defaultModel, normalizeRequestForOperation)
 	return stream
 }
 
-// TimeoutMiddleware 创建超时控制中间件
-func TimeoutMiddleware(timeout time.Duration) Middleware {
-	return func(next Handler) Handler {
-		return func(ctx context.Context, req *Request) (*Response, error) {
-			ctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
+func NormalizeResponseRequestMiddleware(defaultModel string) ResponseMiddleware {
+	unary, _ := normalizeMiddleware[*ResponseRequest, *ResponseObject, ResponseStream](defaultModel, normalizeResponseRequestForOperation)
+	return unary
+}
 
-			resp, err := next(ctx, req)
-			if err != nil {
-				if ctx.Err() == context.DeadlineExceeded {
-					return nil, NewLLMError(ErrCodeTimeout, "request timeout", ctx.Err())
-				}
-				return nil, err
-			}
-			return resp, nil
-		}
+func NormalizeResponseRequestStreamMiddleware(defaultModel string) ResponseStreamMiddleware {
+	_, stream := normalizeMiddleware[*ResponseRequest, *ResponseObject, ResponseStream](defaultModel, normalizeResponseRequestForOperation)
+	return stream
+}
+
+// -----------------------------------------------------------------------------
+// Standard Middleware Application
+// -----------------------------------------------------------------------------
+
+func ApplyStandardMiddleware(engine Engine, opts StandardMiddlewareOptions) Engine {
+	pipeline := applyStandardMiddleware(chatSuite, enginePipelineAdapter{engine}, opts)
+	return &enginePipelineBridge{pipeline: pipeline}
+}
+
+func ApplyStandardResponseMiddleware(engine *OpenAIResponsesEngine, opts StandardMiddlewareOptions) *OpenAIResponsesEngine {
+	pipeline := applyStandardMiddleware(responsesSuite, responseEnginePipelineAdapter{engine}, opts)
+	return &OpenAIResponsesEngine{
+		adapter: engine.adapter,
+		wrapped: &responsesMiddlewareEngine{pipeline: pipeline, inner: engine},
 	}
 }
 
-// TimeoutStreamMiddleware 创建流式请求的超时控制中间件
-func TimeoutStreamMiddleware(timeout time.Duration) StreamMiddleware {
-	return func(next StreamHandler) StreamHandler {
-		return func(ctx context.Context, req *Request) (StreamIterator, error) {
-			ctx, cancel := context.WithTimeout(ctx, timeout)
+// -----------------------------------------------------------------------------
+// Pipeline Chaining
+// -----------------------------------------------------------------------------
 
-			iter, err := next(ctx, req)
-			if err != nil {
-				cancel()
-				if ctx.Err() == context.DeadlineExceeded {
-					return nil, NewLLMError(ErrCodeTimeout, "stream request timeout", ctx.Err())
-				}
-				return nil, err
-			}
+func ChainWithStreamAndClosers(engine Engine, middlewares []Middleware, streamMiddlewares []StreamMiddleware, closers []func()) Engine {
+	pipeline := ChainPipelineWithStreamAndClosers[*Request, *Response, StreamIterator](
+		enginePipelineAdapter{engine}, middlewares, streamMiddlewares, closers,
+	)
+	return &enginePipelineBridge{pipeline: pipeline}
+}
 
-			return &timeoutStreamIterator{inner: iter, cancel: cancel, ctx: ctx}, nil
-		}
+type enginePipelineAdapter struct{ Engine }
+
+func (a enginePipelineAdapter) Generate(ctx context.Context, req *Request) (*Response, error) {
+	return a.Engine.Generate(ctx, req)
+}
+func (a enginePipelineAdapter) Stream(ctx context.Context, req *Request) (StreamIterator, error) {
+	return a.Engine.Stream(ctx, req)
+}
+
+type enginePipelineBridge struct {
+	pipeline PipelineEngine[*Request, *Response, StreamIterator]
+}
+
+func (b *enginePipelineBridge) Generate(ctx context.Context, req *Request) (*Response, error) {
+	return b.pipeline.Generate(ctx, req)
+}
+func (b *enginePipelineBridge) Stream(ctx context.Context, req *Request) (StreamIterator, error) {
+	return b.pipeline.Stream(ctx, req)
+}
+func (b *enginePipelineBridge) Close() {
+	if closer, ok := b.pipeline.(PipelineCloser); ok {
+		closer.Close()
 	}
 }
 
-type timeoutStreamIterator struct {
-	inner      StreamIterator
-	cancel     context.CancelFunc
-	ctx        context.Context
-	ctxStopped bool
-	closeOnce  sync.Once
-	closeErr   error
+type responsesMiddlewareEngine struct {
+	pipeline PipelineEngine[*ResponseRequest, *ResponseObject, ResponseStream]
+	inner    *OpenAIResponsesEngine
 }
 
-func (t *timeoutStreamIterator) Next() bool {
-	if t.ctxStopped {
-		return false
-	}
+type responseEnginePipelineAdapter struct{ engine *OpenAIResponsesEngine }
 
-	type nextResult struct {
-		ok bool
-	}
-	resultCh := make(chan nextResult, 1)
-	go func() {
-		resultCh <- nextResult{ok: t.inner.Next()}
-	}()
-
-	select {
-	case result := <-resultCh:
-		if !result.ok && t.ctx.Err() == context.DeadlineExceeded {
-			t.ctxStopped = true
-			_ = t.Close()
-		}
-		if !result.ok {
-			_ = t.Close()
-		}
-		return result.ok
-	case <-t.ctx.Done():
-		t.ctxStopped = true
-		interruptStreamIterator(t.inner, NewLLMError(ErrCodeTimeout, "stream read timeout", t.ctx.Err()))
-		_ = t.Close()
-		return false
-	}
+func (a responseEnginePipelineAdapter) Generate(ctx context.Context, req *ResponseRequest) (*ResponseObject, error) {
+	return a.engine.Create(ctx, req)
 }
-func (t *timeoutStreamIterator) Chunk() []byte       { return t.inner.Chunk() }
-func (t *timeoutStreamIterator) Text() string        { return t.inner.Text() }
-func (t *timeoutStreamIterator) FullText() string    { return t.inner.FullText() }
-func (t *timeoutStreamIterator) Usage() *Usage       { return t.inner.Usage() }
-func (t *timeoutStreamIterator) Response() *Response { return t.inner.Response() }
-func (t *timeoutStreamIterator) Err() error {
-	err := t.inner.Err()
-	if t.ctxStopped {
-		if err != nil {
-			return NewLLMError(ErrCodeTimeout, "stream read timeout", err)
-		}
-		return NewLLMError(ErrCodeTimeout, "stream read timeout", nil)
-	}
-	if err != nil && t.ctx.Err() == context.DeadlineExceeded {
-		return NewLLMError(ErrCodeTimeout, "stream read timeout", err)
-	}
-	return err
-}
-func (t *timeoutStreamIterator) Close() error {
-	t.closeOnce.Do(func() {
-		t.closeErr = t.inner.Close()
-		t.cancel()
-	})
-	return t.closeErr
-}
-func (t *timeoutStreamIterator) Interrupt(err error) {
-	t.ctxStopped = true
-	interruptStreamIterator(t.inner, err)
-	_ = t.Close()
+func (a responseEnginePipelineAdapter) Stream(ctx context.Context, req *ResponseRequest) (ResponseStream, error) {
+	return a.engine.Stream(ctx, req)
 }
 
-// RequestIDMiddleware 创建请求ID追踪中间件
-func RequestIDMiddleware(generator func() string) Middleware {
-	if generator == nil {
-		generator = func() string { return generateRequestID() }
-	}
-	return func(next Handler) Handler {
-		return func(ctx context.Context, req *Request) (*Response, error) {
-			reqID := GetRequestID(ctx)
-			if reqID == "" {
-				reqID = generator()
-				ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
-			}
-
-			cloned := cloneRequestForMetadata(req)
-			if cloned.Meta == nil {
-				cloned.Meta = make(map[string]any)
-			}
-			cloned.Meta["request_id"] = reqID
-
-			resp, err := next(ctx, cloned)
-			if err != nil {
-				return nil, err
-			}
-
-			if resp != nil {
-				if resp.Meta == nil {
-					resp.Meta = make(map[string]any)
-				}
-				resp.Meta["request_id"] = reqID
-			}
-
-			return resp, err
-		}
+func (m *responsesMiddlewareEngine) create(ctx context.Context, req *ResponseRequest) (*ResponseObject, error) {
+	return m.pipeline.Generate(ctx, req)
+}
+func (m *responsesMiddlewareEngine) stream(ctx context.Context, req *ResponseRequest) (ResponseStream, error) {
+	return m.pipeline.Stream(ctx, req)
+}
+func (m *responsesMiddlewareEngine) close() {
+	if closer, ok := m.pipeline.(PipelineCloser); ok {
+		closer.Close()
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Utilities
+// -----------------------------------------------------------------------------
 
 type ctxKeyRequestID struct{}
 
-type telemetryOwner string
-
-const (
-	telemetryOwnerLogging  telemetryOwner = "logging"
-	telemetryOwnerObserver telemetryOwner = "observer"
-)
-
-type ctxKeyTelemetryOwner struct{}
-
-func claimTelemetryOwnership(ctx context.Context, owner telemetryOwner) (context.Context, bool) {
-	if existing, ok := ctx.Value(ctxKeyTelemetryOwner{}).(telemetryOwner); ok {
-		return ctx, existing == owner
-	}
-	return context.WithValue(ctx, ctxKeyTelemetryOwner{}, owner), true
-}
-
-// RequestIDStreamMiddleware 创建流式请求的请求ID追踪中间件
-func RequestIDStreamMiddleware(generator func() string) StreamMiddleware {
-	if generator == nil {
-		generator = func() string { return generateRequestID() }
-	}
-	return func(next StreamHandler) StreamHandler {
-		return func(ctx context.Context, req *Request) (StreamIterator, error) {
-			reqID := GetRequestID(ctx)
-			if reqID == "" {
-				reqID = generator()
-				ctx = context.WithValue(ctx, ctxKeyRequestID{}, reqID)
-			}
-
-			cloned := cloneRequestForMetadata(req)
-			if cloned.Meta == nil {
-				cloned.Meta = make(map[string]any)
-			}
-			cloned.Meta["request_id"] = reqID
-
-			iter, err := next(ctx, cloned)
-			if err != nil {
-				return nil, err
-			}
-
-			return &requestIDStreamIterator{inner: iter, requestID: reqID}, nil
-		}
-	}
-}
-
-type requestIDStreamIterator struct {
-	inner     StreamIterator
-	requestID string
-	closeOnce syncOnceErr
-}
-
-func (r *requestIDStreamIterator) Next() bool {
-	ok := r.inner.Next()
-	if !ok {
-		_ = r.Close()
-	}
-	return ok
-}
-func (r *requestIDStreamIterator) Chunk() []byte    { return r.inner.Chunk() }
-func (r *requestIDStreamIterator) Text() string     { return r.inner.Text() }
-func (r *requestIDStreamIterator) FullText() string { return r.inner.FullText() }
-func (r *requestIDStreamIterator) Err() error       { return r.inner.Err() }
-func (r *requestIDStreamIterator) Usage() *Usage    { return r.inner.Usage() }
-func (r *requestIDStreamIterator) Close() error     { return r.closeOnce.Do(r.inner.Close) }
-func (r *requestIDStreamIterator) Interrupt(err error) {
-	interruptStreamIterator(r.inner, err)
-}
-
-func (r *requestIDStreamIterator) Response() *Response {
-	resp := r.inner.Response()
-	if resp == nil {
-		return nil
-	}
-	if resp.Meta == nil {
-		resp.Meta = make(map[string]any)
-	}
-	resp.Meta["request_id"] = r.requestID
-	return resp
-}
-
-// GetRequestID 从上下文获取请求ID
 func GetRequestID(ctx context.Context) string {
 	if id, ok := ctx.Value(ctxKeyRequestID{}).(string); ok {
 		return id
@@ -554,9 +820,6 @@ func GetRequestID(ctx context.Context) string {
 	return ""
 }
 
-// WithRequestID stores a request id in context so logs, observers, and
-// middleware can correlate work even when requests originate outside the
-// standard slm middleware chain.
 func WithRequestID(ctx context.Context, requestID string) context.Context {
 	requestID = strings.TrimSpace(requestID)
 	if requestID == "" {
@@ -570,29 +833,6 @@ func requestModel(req *Request) string {
 		return ""
 	}
 	return req.Model
-}
-
-func normalizeRequestForOperation(req *Request, defaultModel string, stream bool) *Request {
-	if req == nil {
-		return nil
-	}
-
-	model := strings.TrimSpace(req.Model)
-	resolvedModel := model
-	if resolvedModel == "" {
-		resolvedModel = strings.TrimSpace(defaultModel)
-	}
-
-	if req.Stream == stream && model == resolvedModel {
-		return req
-	}
-
-	clone := cloneRequestShallow(req)
-	clone.Stream = stream
-	if model == "" {
-		clone.Model = resolvedModel
-	}
-	return clone
 }
 
 func interruptStreamIterator(iter StreamIterator, err error) {

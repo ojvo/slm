@@ -59,7 +59,7 @@ func NewMetricsObserver(meter Meter, opts MetricsObserverOptions) LifecycleObser
 	if meter == nil {
 		return nil
 	}
-	prefix := stringsOrDefault(opts.Namespace, "slm")
+	prefix := defaultString(opts.Namespace, "slm")
 	return &metricsObserver{
 		started:          meter.Int64Counter(prefix+".requests_started", "Number of LLM requests started", "1"),
 		finished:         meter.Int64Counter(prefix+".requests_finished", "Number of LLM requests finished", "1"),
@@ -79,7 +79,7 @@ func NewTraceObserver(tracer Tracer, opts TraceObserverOptions) LifecycleObserve
 	}
 	return &traceObserver{
 		tracer:     tracer,
-		spanPrefix: stringsOrDefault(opts.SpanPrefix, "slm"),
+		spanPrefix: defaultString(opts.SpanPrefix, "slm"),
 		spans:      make(map[string]Span),
 	}
 }
@@ -100,20 +100,21 @@ type logObserver struct {
 }
 
 func (o *logObserver) OnRequestStart(ctx context.Context, event LifecycleEvent) {
-	logRequestStart(o.logger, "LLM request start", GetRequestID(ctx), RequestDiagnosticFields(event.Request))
+	logRequestStart(o.logger, "LLM request start", GetRequestID(ctx), eventDiagnosticFields(event))
 }
 
 func (o *logObserver) OnRequestFinish(ctx context.Context, event LifecycleEvent) {
 	requestID := GetRequestID(ctx)
-	requestFields := RequestDiagnosticFields(event.Request)
+	requestFields := eventDiagnosticFields(event)
 	if event.Err != nil {
 		logRequestFailure(o.logger, "LLM request failed", event.Duration, requestID, requestFields, event.Err)
 		return
 	}
-	if event.Response != nil {
+	_, _, total := event.TokenUsage()
+	if status := event.FinishStatus(); status != "" {
 		logRequestCompleted(o.logger, "LLM request completed", event.Duration, requestID,
-			"tokens", event.Response.Usage.TotalTokens,
-			"finish_reason", event.Response.FinishReason,
+			"tokens", total,
+			"finish_status", status,
 		)
 		return
 	}
@@ -121,7 +122,7 @@ func (o *logObserver) OnRequestFinish(ctx context.Context, event LifecycleEvent)
 }
 
 func (o *logObserver) OnStreamStart(ctx context.Context, event LifecycleEvent) {
-	logRequestStart(o.logger, "LLM stream start", GetRequestID(ctx), RequestDiagnosticFields(event.Request))
+	logRequestStart(o.logger, "LLM stream start", GetRequestID(ctx), eventDiagnosticFields(event))
 }
 
 func (o *logObserver) OnStreamConnected(ctx context.Context, _ LifecycleEvent) {
@@ -130,18 +131,16 @@ func (o *logObserver) OnStreamConnected(ctx context.Context, _ LifecycleEvent) {
 
 func (o *logObserver) OnStreamFinish(ctx context.Context, event LifecycleEvent) {
 	requestID := GetRequestID(ctx)
-	requestFields := RequestDiagnosticFields(event.Request)
+	requestFields := eventDiagnosticFields(event)
 	if event.Err != nil {
 		logRequestFailure(o.logger, "LLM stream closed with error", event.Duration, requestID, requestFields, event.Err)
 		return
 	}
-	tokens := 0
-	if event.Response != nil {
-		tokens = event.Response.Usage.TotalTokens
-	}
+	_, _, total := event.TokenUsage()
+	model := event.Model
 	logRequestCompleted(o.logger, "LLM stream completed", event.Duration, requestID,
-		"tokens", tokens,
-		"model", requestModel(event.Request),
+		"tokens", total,
+		"model", model,
 	)
 }
 
@@ -172,10 +171,11 @@ func (m *metricsObserver) recordFinish(ctx context.Context, event LifecycleEvent
 	if event.Err != nil {
 		m.errors.Add(ctx, 1, attrs...)
 	}
-	if event.Response != nil {
-		m.promptTokens.Record(ctx, float64(event.Response.Usage.PromptTokens), attrs...)
-		m.completionTokens.Record(ctx, float64(event.Response.Usage.CompletionTokens), attrs...)
-		m.totalTokens.Record(ctx, float64(event.Response.Usage.TotalTokens), attrs...)
+	prompt, completion, total := event.TokenUsage()
+	if total > 0 {
+		m.promptTokens.Record(ctx, float64(prompt), attrs...)
+		m.completionTokens.Record(ctx, float64(completion), attrs...)
+		m.totalTokens.Record(ctx, float64(total), attrs...)
 	}
 }
 
@@ -222,12 +222,15 @@ func (t *traceObserver) finish(event LifecycleEvent) {
 	}
 	attrs := metricAttributes(event)
 	attrs = append(attrs, Attribute{Key: "duration_ms", Value: float64(event.Duration.Milliseconds())})
-	if event.Response != nil {
+	if status := event.FinishStatus(); status != "" {
+		attrs = append(attrs, Attribute{Key: "finish_status", Value: status})
+	}
+	prompt, completion, total := event.TokenUsage()
+	if total > 0 {
 		attrs = append(attrs,
-			Attribute{Key: "finish_reason", Value: event.Response.FinishReason},
-			Attribute{Key: "usage.prompt_tokens", Value: event.Response.Usage.PromptTokens},
-			Attribute{Key: "usage.completion_tokens", Value: event.Response.Usage.CompletionTokens},
-			Attribute{Key: "usage.total_tokens", Value: event.Response.Usage.TotalTokens},
+			Attribute{Key: "usage.prompt_tokens", Value: prompt},
+			Attribute{Key: "usage.completion_tokens", Value: completion},
+			Attribute{Key: "usage.total_tokens", Value: total},
 		)
 	}
 	span.SetAttributes(attrs...)
@@ -272,11 +275,4 @@ func metricAttributes(event LifecycleEvent) []Attribute {
 		attrs = append(attrs, negotiated.Requested.attributes()...)
 	}
 	return attrs
-}
-
-func stringsOrDefault(value, fallback string) string {
-	if value != "" {
-		return value
-	}
-	return fallback
 }

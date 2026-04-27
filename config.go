@@ -74,15 +74,6 @@ func (c Config) WithRateLimit(limit float64, burst int) Config {
 	return c
 }
 
-// BuildEngine 根据配置构建 Engine
-func (c Config) BuildEngine(createEngine func(ProviderConfig) (Engine, error)) (Engine, error) {
-	engine, err := createEngine(c.Provider)
-	if err != nil {
-		return nil, err
-	}
-	return c.applyMiddleware(engine), nil
-}
-
 // BuildEngineWithTransport 根据配置和 Transport 构建 Engine。
 // 如果配置了 Transport，使用 NewOpenAIWithTransport 创建引擎；
 // 否则使用 ProviderConfig 的 Endpoint/APIKey 创建 HTTP 传输。
@@ -106,6 +97,26 @@ func (c Config) BuildEngineWithTransport() (Engine, error) {
 	return c.applyMiddleware(engine), nil
 }
 
+func (c Config) BuildResponsesEngine() (*OpenAIResponsesEngine, error) {
+	var engine *OpenAIResponsesEngine
+	if c.Transport != nil {
+		if c.Provider.DefaultModel == "" {
+			return nil, NewLLMError(ErrCodeInvalidConfig, "DefaultModel is required when using custom Transport", nil)
+		}
+		engine = NewOpenAIResponsesWithTransport(c.Transport, c.Provider.DefaultModel)
+	} else {
+		if c.Provider.Endpoint == "" {
+			return nil, NewLLMError(ErrCodeInvalidConfig, "Endpoint is required when Transport is not set", nil)
+		}
+		if c.Provider.DefaultModel == "" {
+			return nil, NewLLMError(ErrCodeInvalidConfig, "DefaultModel is required", nil)
+		}
+		engine = NewOpenAIResponsesProtocol(c.Provider.Endpoint, c.Provider.APIKey, c.Provider.DefaultModel)
+	}
+
+	return c.applyResponsesMiddleware(engine), nil
+}
+
 // applyMiddleware 统一应用标准中间件
 func (c Config) applyMiddleware(engine Engine) Engine {
 	retry := c.Retry
@@ -113,11 +124,13 @@ func (c Config) applyMiddleware(engine Engine) Engine {
 		DefaultModel:       c.Provider.DefaultModel,
 		Capabilities:       c.resolvedCapabilities(),
 		Observers:          c.Observers,
-		Retry:              &retry,
-		Timeout:            c.Timeout,
 		EnableRequestID:    c.RequestIDEnabled,
 		RequestIDGenerator: c.RequestIDGenerator,
-		RateLimit:          c.RateLimit,
+		CrossCutting: CrossCuttingMiddlewareOptions{
+			Retry:     &retry,
+			Timeout:   c.Timeout,
+			RateLimit: c.RateLimit,
+		},
 	})
 }
 
@@ -132,13 +145,24 @@ func (c Config) resolvedCapabilities() *CapabilityNegotiationOptions {
 	return &clone
 }
 
-// #sym:defaultAPIKey
-const DefaultAPIKey = ""
+func (c Config) applyResponsesMiddleware(engine *OpenAIResponsesEngine) *OpenAIResponsesEngine {
+	retry := c.Retry
+	return ApplyStandardResponseMiddleware(engine, StandardMiddlewareOptions{
+		DefaultModel:       c.Provider.DefaultModel,
+		Capabilities:       c.resolvedCapabilities(),
+		Observers:          c.Observers,
+		EnableRequestID:    c.RequestIDEnabled,
+		RequestIDGenerator: c.RequestIDGenerator,
+		CrossCutting: CrossCuttingMiddlewareOptions{
+			Retry:     &retry,
+			Timeout:   c.Timeout,
+			RateLimit: c.RateLimit,
+		},
+	})
+}
 
-// ProviderConfig 提供商配置
 type ProviderConfig struct {
-	Endpoint      string
-	DefaultModel  string
-	APIKey        string
-	DefaultAPIKey string // #sym:defaultAPIKey 可用于配置文件读取和默认密钥
+	Endpoint     string
+	DefaultModel string
+	APIKey       string
 }

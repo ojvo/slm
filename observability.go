@@ -10,15 +10,37 @@ import (
 
 // LifecycleEvent describes a unary or streaming lifecycle transition.
 type LifecycleEvent struct {
-	OperationID string
-	RequestID   string
-	Model       string
-	Context     context.Context
-	Request     *Request
-	Response    *Response
-	Duration    time.Duration
-	Err         error
-	Stream      bool
+	OperationID     string
+	RequestID       string
+	Model           string
+	Context         context.Context
+	Request         *Request
+	Response        *Response
+	ResponseRequest *ResponseRequest
+	ResponseObject  *ResponseObject
+	Duration        time.Duration
+	Err             error
+	Stream          bool
+}
+
+func (e LifecycleEvent) TokenUsage() (prompt, completion, total int) {
+	if e.Response != nil {
+		return e.Response.Usage.PromptTokens, e.Response.Usage.CompletionTokens, e.Response.Usage.TotalTokens
+	}
+	if e.ResponseObject != nil && e.ResponseObject.Usage != nil {
+		return e.ResponseObject.Usage.InputTokens, e.ResponseObject.Usage.OutputTokens, e.ResponseObject.Usage.TotalTokens
+	}
+	return 0, 0, 0
+}
+
+func (e LifecycleEvent) FinishStatus() string {
+	if e.Response != nil {
+		return e.Response.FinishReason
+	}
+	if e.ResponseObject != nil {
+		return e.ResponseObject.Status
+	}
+	return ""
 }
 
 // LifecycleObserver receives request and stream lifecycle callbacks.
@@ -69,24 +91,48 @@ func (o compositeLifecycleObserver) OnStreamFinish(ctx context.Context, event Li
 
 // LifecycleObserverMiddleware creates unary and stream middlewares that emit
 // structured lifecycle events to the supplied observer.
-func LifecycleObserverMiddleware(observer LifecycleObserver) (Middleware, StreamMiddleware) {
-	return lifecycleObserverMiddlewareWithOwner(observer, telemetryOwnerObserver)
+type eventBuilder[Req any, Resp any, StreamResp any] struct {
+	model         func(Req) string
+	buildEvent    func(opID, reqID, model string, ctx context.Context, req Req, stream bool) LifecycleEvent
+	setResponse   func(event *LifecycleEvent, resp Resp)
+	setStreamResp func(event *LifecycleEvent, stream StreamResp)
 }
 
-func lifecycleObserverMiddlewareWithOwner(observer LifecycleObserver, owner telemetryOwner) (Middleware, StreamMiddleware) {
-	unary := func(next Handler) Handler {
-		return func(ctx context.Context, req *Request) (*Response, error) {
-			ctx, owns := claimTelemetryOwnership(ctx, owner)
-			if !owns {
-				return next(ctx, req)
-			}
+var chatEventBuilder = eventBuilder[*Request, *Response, StreamIterator]{
+	model: requestModel,
+	buildEvent: func(opID, reqID, model string, ctx context.Context, req *Request, stream bool) LifecycleEvent {
+		return LifecycleEvent{OperationID: opID, RequestID: reqID, Model: model, Context: ctx, Request: req, Stream: stream}
+	},
+	setResponse:   func(event *LifecycleEvent, resp *Response) { event.Response = resp },
+	setStreamResp: func(event *LifecycleEvent, stream StreamIterator) { event.Response = stream.Response() },
+}
 
-			event := LifecycleEvent{OperationID: generateOperationID(), RequestID: GetRequestID(ctx), Model: requestModel(req), Context: ctx, Request: req}
+var responsesEventBuilder = eventBuilder[*ResponseRequest, *ResponseObject, ResponseStream]{
+	model: responseRequestModel,
+	buildEvent: func(opID, reqID, model string, ctx context.Context, req *ResponseRequest, stream bool) LifecycleEvent {
+		return LifecycleEvent{OperationID: opID, RequestID: reqID, Model: model, Context: ctx, ResponseRequest: req, Stream: stream}
+	},
+	setResponse:   func(event *LifecycleEvent, resp *ResponseObject) { event.ResponseObject = resp },
+	setStreamResp: func(event *LifecycleEvent, stream ResponseStream) {},
+}
+
+func lifecycleObserverMiddleware[Req any, Resp any, StreamResp any](
+	observer LifecycleObserver,
+	builder eventBuilder[Req, Resp, StreamResp],
+) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
+	passUnary := func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp] { return next }
+	passStream := func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp] { return next }
+	if observer == nil {
+		return passUnary, passStream
+	}
+
+	unary := func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp] {
+		return func(ctx context.Context, req Req) (Resp, error) {
+			event := builder.buildEvent(generateOperationID(), GetRequestID(ctx), builder.model(req), ctx, req, false)
 			observer.OnRequestStart(ctx, event)
 			start := time.Now()
-
 			resp, err := next(ctx, req)
-			event.Response = resp
+			builder.setResponse(&event, resp)
 			event.Err = err
 			event.Duration = time.Since(start)
 			observer.OnRequestFinish(ctx, event)
@@ -94,72 +140,126 @@ func lifecycleObserverMiddlewareWithOwner(observer LifecycleObserver, owner tele
 		}
 	}
 
-	stream := func(next StreamHandler) StreamHandler {
-		return func(ctx context.Context, req *Request) (StreamIterator, error) {
-			ctx, owns := claimTelemetryOwnership(ctx, owner)
-			if !owns {
-				return next(ctx, req)
-			}
-
-			event := LifecycleEvent{OperationID: generateOperationID(), RequestID: GetRequestID(ctx), Model: requestModel(req), Context: ctx, Request: req, Stream: true}
+	stream := func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp] {
+		return func(ctx context.Context, req Req) (StreamResp, error) {
+			var zero StreamResp
+			event := builder.buildEvent(generateOperationID(), GetRequestID(ctx), builder.model(req), ctx, req, true)
 			observer.OnStreamStart(ctx, event)
 			start := time.Now()
-
-			iter, err := next(ctx, req)
+			result, err := next(ctx, req)
 			if err != nil {
 				event.Err = err
 				event.Duration = time.Since(start)
 				observer.OnStreamFinish(ctx, event)
-				return nil, err
+				return zero, err
 			}
-
 			event.Duration = time.Since(start)
 			observer.OnStreamConnected(ctx, event)
-			return &observedStreamIterator{inner: iter, observer: observer, ctx: ctx, start: start, event: event}, nil
+			return wrapObservedStream(observer, ctx, start, event, result, builder), nil
 		}
 	}
 
 	return unary, stream
 }
 
-type observedStreamIterator struct {
-	inner     StreamIterator
+type observedStreamCore struct {
 	observer  LifecycleObserver
 	ctx       context.Context
 	start     time.Time
 	event     LifecycleEvent
+	onFinish  func(*LifecycleEvent)
 	closeOnce syncOnceErr
 }
 
-func (o *observedStreamIterator) Next() bool {
+func (c *observedStreamCore) onClose(inner BaseStream) error {
+	return c.closeOnce.Do(func() error {
+		closeErr := inner.Close()
+		c.event.Duration = time.Since(c.start)
+		if c.onFinish != nil {
+			c.onFinish(&c.event)
+		}
+		if closeErr != nil {
+			c.event.Err = closeErr
+		} else {
+			c.event.Err = inner.Err()
+		}
+		c.observer.OnStreamFinish(c.ctx, c.event)
+		return closeErr
+	})
+}
+
+type observedChatStream struct {
+	streamIteratorWrapper
+	core observedStreamCore
+}
+
+func (o *observedChatStream) Next() bool {
 	ok := o.inner.Next()
 	if !ok {
-		_ = o.Close()
+		_ = o.core.onClose(o.inner)
 	}
 	return ok
 }
-func (o *observedStreamIterator) Chunk() []byte       { return o.inner.Chunk() }
-func (o *observedStreamIterator) Text() string        { return o.inner.Text() }
-func (o *observedStreamIterator) FullText() string    { return o.inner.FullText() }
-func (o *observedStreamIterator) Err() error          { return o.inner.Err() }
-func (o *observedStreamIterator) Usage() *Usage       { return o.inner.Usage() }
-func (o *observedStreamIterator) Response() *Response { return o.inner.Response() }
-func (o *observedStreamIterator) Interrupt(err error) { interruptStreamIterator(o.inner, err) }
+func (o *observedChatStream) Interrupt(err error) { interruptStreamIterator(o.inner, err) }
+func (o *observedChatStream) Close() error {
+	return o.core.onClose(o.inner)
+}
 
-func (o *observedStreamIterator) Close() error {
-	return o.closeOnce.Do(func() error {
-		closeErr := o.inner.Close()
-		o.event.Duration = time.Since(o.start)
-		o.event.Response = o.inner.Response()
-		if closeErr != nil {
-			o.event.Err = closeErr
-		} else {
-			o.event.Err = o.inner.Err()
+type observedResponseStreamWrapper struct {
+	responseStreamWrapper
+	core observedStreamCore
+}
+
+func (o *observedResponseStreamWrapper) Next() bool {
+	ok := o.inner.Next()
+	if !ok {
+		_ = o.core.onClose(o.inner)
+	}
+	return ok
+}
+func (o *observedResponseStreamWrapper) Close() error {
+	return o.core.onClose(o.inner)
+}
+
+func wrapObservedStream[Req any, Resp any, StreamResp any](
+	observer LifecycleObserver,
+	ctx context.Context,
+	start time.Time,
+	event LifecycleEvent,
+	inner StreamResp,
+	builder eventBuilder[Req, Resp, StreamResp],
+) StreamResp {
+	core := observedStreamCore{observer: observer, ctx: ctx, start: start, event: event}
+	builder.setStreamResp(&event, inner)
+	switch s := any(inner).(type) {
+	case StreamIterator:
+		core.onFinish = func(e *LifecycleEvent) {
+			e.Response = s.Response()
 		}
-		observer := o.observer
-		observer.OnStreamFinish(o.ctx, o.event)
-		return closeErr
-	})
+		w := &observedChatStream{streamIteratorWrapper: streamIteratorWrapper{inner: s}, core: core}
+		if result, ok := any(w).(StreamResp); ok {
+			return result
+		}
+	case ResponseStream:
+		core.onFinish = func(e *LifecycleEvent) {
+			if current := s.Current(); current.Response != nil {
+				e.ResponseObject = current.Response
+			}
+		}
+		w := &observedResponseStreamWrapper{responseStreamWrapper: responseStreamWrapper{inner: s}, core: core}
+		if result, ok := any(w).(StreamResp); ok {
+			return result
+		}
+	}
+	return inner
+}
+
+func LifecycleObserverMiddleware(observer LifecycleObserver) (Middleware, StreamMiddleware) {
+	return lifecycleObserverMiddleware(observer, chatEventBuilder)
+}
+
+func ResponseLifecycleObserverMiddleware(observer LifecycleObserver) (ResponseMiddleware, ResponseStreamMiddleware) {
+	return lifecycleObserverMiddleware(observer, responsesEventBuilder)
 }
 
 type syncOnceErr struct {
@@ -179,3 +279,10 @@ func generateOperationID() string {
 }
 
 var operationCounter atomic.Int64
+
+func responseRequestModel(req *ResponseRequest) string {
+	if req == nil {
+		return ""
+	}
+	return req.Model
+}

@@ -12,15 +12,16 @@ import (
 // The zero value requests reasoning capability without provider-specific tuning.
 // Effort is forwarded to OpenAI-compatible providers via "reasoning_effort".
 type ReasoningOptions struct {
-	Effort string
+	Effort  string
+	Summary string
 }
 
 // CapabilitySet represents the feature surface of a model or request.
 type CapabilitySet struct {
-	JSONMode  bool
-	ToolCalls bool
-	Vision    bool
-	Reasoning bool
+	JSONMode  bool `json:"json_mode,omitempty"`
+	ToolCalls bool `json:"tool_calls,omitempty"`
+	Vision    bool `json:"vision,omitempty"`
+	Reasoning bool `json:"reasoning,omitempty"`
 }
 
 // Any reports whether any capability bit is enabled.
@@ -58,6 +59,22 @@ func (c CapabilitySet) attributes() []Attribute {
 type ModelCapabilities struct {
 	Model    string
 	Supports CapabilitySet
+	Limits   ModelLimits
+	Meta     map[string]any
+}
+
+func cloneModelCapabilities(caps ModelCapabilities) ModelCapabilities {
+	return ModelCapabilities{
+		Model:    caps.Model,
+		Supports: caps.Supports,
+		Limits:   caps.Limits,
+		Meta:     cloneMap(caps.Meta),
+	}
+}
+
+// CapabilityCatalog exposes the current model capability catalog snapshot.
+type CapabilityCatalog interface {
+	ListModelCapabilities(ctx context.Context) ([]ModelCapabilities, CapabilityResolverState, error)
 }
 
 // CapabilityResolver resolves explicit capabilities for a concrete model name.
@@ -232,37 +249,7 @@ func DetectRequestedResponseCapabilities(req *ResponseRequest) CapabilitySet {
 
 // CapabilityNegotiationMiddleware validates explicit request requirements against model capabilities.
 func CapabilityNegotiationMiddleware(opts CapabilityNegotiationOptions) (Middleware, StreamMiddleware) {
-	passUnary := func(next Handler) Handler { return next }
-	passStream := func(next StreamHandler) StreamHandler { return next }
-	if opts.Resolver == nil {
-		return passUnary, passStream
-	}
-
-	negotiate := func(ctx context.Context, req *Request) (context.Context, *Request, error) {
-		return NegotiateRequestCapabilities(ctx, req, opts)
-	}
-
-	unary := func(next Handler) Handler {
-		return func(ctx context.Context, req *Request) (*Response, error) {
-			ctx, req, err := negotiate(ctx, req)
-			if err != nil {
-				return nil, err
-			}
-			return next(ctx, req)
-		}
-	}
-
-	stream := func(next StreamHandler) StreamHandler {
-		return func(ctx context.Context, req *Request) (StreamIterator, error) {
-			ctx, req, err := negotiate(ctx, req)
-			if err != nil {
-				return nil, err
-			}
-			return next(ctx, req)
-		}
-	}
-
-	return unary, stream
+	return capabilityNegotiationMiddleware[*Request, *Response, StreamIterator](opts, NegotiateRequestCapabilities)
 }
 
 // NegotiateRequestCapabilities validates and injects chat request capability negotiation state.
@@ -270,54 +257,51 @@ func CapabilityNegotiationMiddleware(opts CapabilityNegotiationOptions) (Middlew
 // This helper exposes the same capability negotiation logic used by middleware so callers can
 // apply explicit model validation closer to a transport or protocol implementation when needed.
 func NegotiateRequestCapabilities(ctx context.Context, req *Request, opts CapabilityNegotiationOptions) (context.Context, *Request, error) {
-	if req == nil || opts.Resolver == nil {
-		return ctx, req, nil
-	}
-	requested := DetectRequestedCapabilities(req)
-	if negotiated, ok := reusableNegotiatedCapabilities(ctx, req.Model, requested, opts.DefaultModel); ok {
-		if req.Model == "" && negotiated.Model != "" {
-			clone := cloneRequestShallow(req)
-			clone.Model = negotiated.Model
-			req = clone
-		}
-		return ctx, req, nil
-	}
-
-	ctx, model, err := negotiateCapabilities(ctx, req.Model, requested, opts)
-	if err != nil {
-		return ctx, req, err
-	}
-	if req.Model == "" && model != "" {
-		clone := cloneRequestShallow(req)
-		clone.Model = model
-		req = clone
-	}
-	return ctx, req, nil
+	return negotiateCapabilitiesForRequest(ctx, req, opts,
+		func(r *Request) string { return r.Model },
+		DetectRequestedCapabilities,
+		func(r *Request, model string) *Request {
+			clone := cloneRequestShallow(r)
+			clone.Model = model
+			return clone
+		},
+	)
 }
 
-// NegotiateResponseCapabilities validates and injects responses request capability negotiation state.
 func NegotiateResponseCapabilities(ctx context.Context, req *ResponseRequest, opts CapabilityNegotiationOptions) (context.Context, *ResponseRequest, error) {
-	if req == nil || opts.Resolver == nil {
+	return negotiateCapabilitiesForRequest(ctx, req, opts,
+		func(r *ResponseRequest) string { return r.Model },
+		DetectRequestedResponseCapabilities,
+		func(r *ResponseRequest, model string) *ResponseRequest {
+			clone := cloneResponseRequest(r)
+			clone.Model = model
+			return clone
+		},
+	)
+}
+
+func negotiateCapabilitiesForRequest[T any](ctx context.Context, req T, opts CapabilityNegotiationOptions,
+	getModel func(T) string,
+	detectCapabilities func(T) CapabilitySet,
+	assignModel func(T, string) T,
+) (context.Context, T, error) {
+	if any(req) == nil || opts.Resolver == nil {
 		return ctx, req, nil
 	}
-	requested := DetectRequestedResponseCapabilities(req)
-	if negotiated, ok := reusableNegotiatedCapabilities(ctx, req.Model, requested, opts.DefaultModel); ok {
-		if req.Model == "" && negotiated.Model != "" {
-			clone := cloneResponseRequest(req)
-			clone.Model = negotiated.Model
-			req = clone
+	requested := detectCapabilities(req)
+	if negotiated, ok := reusableNegotiatedCapabilities(ctx, getModel(req), requested, opts.DefaultModel); ok {
+		if getModel(req) == "" && negotiated.Model != "" {
+			req = assignModel(req, negotiated.Model)
 		}
 		return ctx, req, nil
 	}
 
-	ctx, model, err := negotiateCapabilities(ctx, req.Model, requested, opts)
+	ctx, model, err := negotiateCapabilities(ctx, getModel(req), requested, opts)
 	if err != nil {
 		return ctx, req, err
 	}
-	if req.Model == "" && model != "" {
-		clone := cloneResponseRequest(req)
-		clone.Model = model
-		req = clone
+	if getModel(req) == "" && model != "" {
+		req = assignModel(req, model)
 	}
 	return ctx, req, nil
 }

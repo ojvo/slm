@@ -164,6 +164,34 @@ func (r *CatalogCapabilityResolver) LastRefreshError() error {
 	return r.lastRefreshErr
 }
 
+// ListModelCapabilities returns the current catalog snapshot used for capability resolution.
+//
+// The resolver refreshes the cache when needed (same policy as ResolveCapabilities) and returns
+// a defensive copy so callers can inspect model metadata without mutating resolver state.
+func (r *CatalogCapabilityResolver) ListModelCapabilities(ctx context.Context) ([]ModelCapabilities, CapabilityResolverState, error) {
+	if r == nil || r.load == nil {
+		return nil, CapabilityResolverState{}, nil
+	}
+	if r.shouldRefresh() {
+		if err := r.refreshOnce(ctx); err != nil {
+			return nil, r.state(), err
+		}
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	state := CapabilityResolverState{Source: CapabilitySourceCatalog, RefreshedAt: r.lastRefresh, Stale: len(r.catalog) > 0 && r.lastRefreshErr != nil}
+	if len(r.catalog) == 0 {
+		return nil, state, nil
+	}
+
+	catalog := make([]ModelCapabilities, 0, len(r.catalog))
+	for _, caps := range r.catalog {
+		catalog = append(catalog, cloneModelCapabilities(caps))
+	}
+	return catalog, state, nil
+}
+
 func (r *CatalogCapabilityResolver) state() CapabilityResolverState {
 	if r == nil {
 		return CapabilityResolverState{}

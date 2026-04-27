@@ -7,11 +7,6 @@ import (
 	"time"
 )
 
-// RetryConfig 重试配置。
-//
-// 对流式请求，重试只发生在首个有效 chunk 产出之前。
-// 一旦已经向调用方返回过任何 chunk，后续断流将直接透传错误，
-// 避免在缺少协议级去重能力时发生重复输出或状态错乱。
 type RetryConfig struct {
 	MaxAttempts int
 	Backoff     func(attempt int) time.Duration
@@ -19,7 +14,6 @@ type RetryConfig struct {
 	WrapError   func(msg string, cause error) error
 }
 
-// DefaultRetryConfig 返回默认重试配置
 func DefaultRetryConfig() RetryConfig {
 	return RetryConfig{
 		MaxAttempts: 3,
@@ -28,7 +22,6 @@ func DefaultRetryConfig() RetryConfig {
 	}
 }
 
-// ExponentialBackoff 指数退避策略
 func ExponentialBackoff(attempt int) time.Duration {
 	if attempt >= 30 {
 		return maxBackoff
@@ -40,8 +33,6 @@ func ExponentialBackoff(attempt int) time.Duration {
 	return d
 }
 
-// ExponentialBackoffWithJitter 指数退避 + 随机抖动策略
-// 防止多客户端同时重试导致的惊群效应
 func ExponentialBackoffWithJitter(attempt int) time.Duration {
 	base := ExponentialBackoff(attempt)
 	jitter := time.Duration(rand.Int63n(int64(base) / 2))
@@ -54,8 +45,22 @@ func ExponentialBackoffWithJitter(attempt int) time.Duration {
 
 const maxBackoff = 30 * time.Second
 
-// RetryMiddlewareWithConfig 使用自定义配置的重试中间件
 func RetryMiddlewareWithConfig(cfg RetryConfig) (Middleware, StreamMiddleware) {
+	return retryMiddlewareWithConfig[*Request, *Response, StreamIterator](cfg,
+		func(req *Request) *Request { return cloneRequestForMetadata(req) },
+	)
+}
+
+func ResponseRetryMiddlewareWithConfig(cfg RetryConfig) (ResponseMiddleware, ResponseStreamMiddleware) {
+	return retryMiddlewareWithConfig[*ResponseRequest, *ResponseObject, ResponseStream](cfg,
+		func(req *ResponseRequest) *ResponseRequest { return cloneResponseRequest(req) },
+	)
+}
+
+func retryMiddlewareWithConfig[Req any, Resp any, StreamResp any](
+	cfg RetryConfig,
+	cloneReq func(Req) Req,
+) (PipelineMiddleware[Req, Resp], PipelineStreamMiddleware[Req, StreamResp]) {
 	if cfg.MaxAttempts < 1 {
 		cfg.MaxAttempts = 1
 	}
@@ -66,100 +71,105 @@ func RetryMiddlewareWithConfig(cfg RetryConfig) (Middleware, StreamMiddleware) {
 		cfg.IsRetryable = IsRetryableError
 	}
 
-	unary := func(next Handler) Handler {
-		return func(ctx context.Context, req *Request) (*Response, error) {
-			return retryUnary(ctx, req, next, cfg)
+	unary := func(next PipelineHandler[Req, Resp]) PipelineHandler[Req, Resp] {
+		return func(ctx context.Context, req Req) (Resp, error) {
+			var zero Resp
+			var lastErr error
+			for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
+				if err := checkContext(ctx, cfg.WrapError); err != nil {
+					return zero, err
+				}
+				retryReq := req
+				if attempt > 1 {
+					retryReq = cloneReq(req)
+				}
+				resp, err := next(ctx, retryReq)
+				if err == nil {
+					return resp, nil
+				}
+				lastErr = err
+				if shouldStopRetry(attempt, cfg.MaxAttempts, err, cfg.IsRetryable) {
+					break
+				}
+				if err := waitRetry(ctx, attempt, cfg); err != nil {
+					return zero, err
+				}
+			}
+			return zero, fmt.Errorf("max retries exceeded: %w", lastErr)
 		}
 	}
 
-	stream := func(next StreamHandler) StreamHandler {
-		return func(ctx context.Context, req *Request) (StreamIterator, error) {
-			return retryStream(ctx, req, next, cfg)
+	stream := func(next PipelineStreamHandler[Req, StreamResp]) PipelineStreamHandler[Req, StreamResp] {
+		return func(ctx context.Context, req Req) (StreamResp, error) {
+			var zero StreamResp
+			var lastErr error
+			for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
+				if err := checkContext(ctx, cfg.WrapError); err != nil {
+					return zero, err
+				}
+				retryReq := req
+				if attempt > 1 {
+					retryReq = cloneReq(req)
+				}
+				result, err := next(ctx, retryReq)
+				if err == nil {
+					w := newRetryStreamWrapper(ctx, req, next, cfg, cloneReq, result, attempt)
+					if wrapped, ok := any(w).(StreamResp); ok {
+						return wrapped, nil
+					}
+					return result, nil
+				}
+				lastErr = err
+				if shouldStopRetry(attempt, cfg.MaxAttempts, err, cfg.IsRetryable) {
+					break
+				}
+				if err := waitRetry(ctx, attempt, cfg); err != nil {
+					return zero, err
+				}
+			}
+			return zero, fmt.Errorf("max retries exceeded: %w", lastErr)
 		}
 	}
 
 	return unary, stream
 }
 
-// retryUnary 统一的重试逻辑（Unary）
-func retryUnary(ctx context.Context, req *Request, next Handler, cfg RetryConfig) (*Response, error) {
-	var lastErr error
-	for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
-		if err := checkContext(ctx, cfg.WrapError); err != nil {
-			return nil, err
-		}
-
-		retryReq := req
-		if attempt > 1 {
-			retryReq = cloneRequestForRetry(req)
-		}
-		resp, err := next(ctx, retryReq)
-		if err == nil {
-			return resp, nil
-		}
-
-		lastErr = err
-		if shouldStopRetry(attempt, cfg.MaxAttempts, err, cfg.IsRetryable) {
-			break
-		}
-
-		if err := waitRetry(ctx, attempt, cfg); err != nil {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
-}
-
-// retryStream 统一的重试逻辑（Stream）
-func retryStream(ctx context.Context, req *Request, next StreamHandler, cfg RetryConfig) (StreamIterator, error) {
-	var lastErr error
-	for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
-		if err := checkContext(ctx, cfg.WrapError); err != nil {
-			return nil, err
-		}
-
-		retryReq := req
-		if attempt > 1 {
-			retryReq = cloneRequestForRetry(req)
-		}
-		iter, err := next(ctx, retryReq)
-		if err == nil {
-			return &retryStreamIterator{
-				ctx:     ctx,
-				req:     req,
-				next:    next,
-				cfg:     cfg,
-				attempt: attempt,
-				inner:   iter,
-			}, nil
-		}
-
-		lastErr = err
-		if shouldStopRetry(attempt, cfg.MaxAttempts, err, cfg.IsRetryable) {
-			break
-		}
-
-		if err := waitRetry(ctx, attempt, cfg); err != nil {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
-}
-
-type retryStreamIterator struct {
+type retryStreamWrapper[Req any, StreamResp any] struct {
+	inner               StreamResp
 	ctx                 context.Context
-	req                 *Request
-	next                StreamHandler
+	req                 Req
+	next                PipelineStreamHandler[Req, StreamResp]
 	cfg                 RetryConfig
+	cloneReq            func(Req) Req
 	attempt             int
-	inner               StreamIterator
 	firstChunkDelivered bool
 	closeOnce           syncOnceErr
 }
 
-func (r *retryStreamIterator) Next() bool {
+func newRetryStreamWrapper[Req any, StreamResp any](
+	ctx context.Context,
+	req Req,
+	next PipelineStreamHandler[Req, StreamResp],
+	cfg RetryConfig,
+	cloneReq func(Req) Req,
+	inner StreamResp,
+	attempt int,
+) *retryStreamWrapper[Req, StreamResp] {
+	return &retryStreamWrapper[Req, StreamResp]{
+		inner:    inner,
+		ctx:      ctx,
+		req:      req,
+		next:     next,
+		cfg:      cfg,
+		cloneReq: cloneReq,
+		attempt:  attempt,
+	}
+}
+
+func (r *retryStreamWrapper[Req, StreamResp]) Next() bool {
+	stream := asBaseStream(r.inner)
 	if r.firstChunkDelivered {
-		ok := r.inner.Next()
+		ok := stream.Next()
 		if !ok {
 			_ = r.Close()
 		}
@@ -168,28 +178,25 @@ func (r *retryStreamIterator) Next() bool {
 	return r.nextUntilFirstChunk()
 }
 
-func (r *retryStreamIterator) nextUntilFirstChunk() bool {
+func (r *retryStreamWrapper[Req, StreamResp]) nextUntilFirstChunk() bool {
+	stream := asBaseStream(r.inner)
 	for {
-		if r.inner.Next() {
+		if stream.Next() {
 			r.firstChunkDelivered = true
 			return true
 		}
-
-		err := r.inner.Err()
+		err := stream.Err()
 		if err == nil {
 			_ = r.Close()
 			return false
 		}
-
 		if shouldStopRetry(r.attempt, r.cfg.MaxAttempts, err, r.cfg.IsRetryable) {
 			return false
 		}
-
-		r.inner.Close()
-
-		iter, attempt, err := r.openNextStreamAttempt()
+		stream.Close()
+		iter, attempt, err := r.openNextAttempt()
 		if err != nil {
-			r.inner = &errorIterator{err: err}
+			r.inner = any(&errorBaseStream{err: err}).(StreamResp)
 			return false
 		}
 		r.inner = iter
@@ -197,18 +204,17 @@ func (r *retryStreamIterator) nextUntilFirstChunk() bool {
 	}
 }
 
-func (r *retryStreamIterator) openNextStreamAttempt() (StreamIterator, int, error) {
+func (r *retryStreamWrapper[Req, StreamResp]) openNextAttempt() (StreamResp, int, error) {
+	var zero StreamResp
 	var lastErr error
 	for attempt := r.attempt + 1; attempt <= r.cfg.MaxAttempts; attempt++ {
 		if err := checkContext(r.ctx, r.cfg.WrapError); err != nil {
-			return nil, 0, err
+			return zero, 0, err
 		}
-
 		if err := waitRetry(r.ctx, attempt, r.cfg); err != nil {
-			return nil, 0, err
+			return zero, 0, err
 		}
-
-		retryReq := cloneRequestForRetry(r.req)
+		retryReq := r.cloneReq(r.req)
 		iter, err := r.next(r.ctx, retryReq)
 		if err != nil {
 			lastErr = err
@@ -219,36 +225,78 @@ func (r *retryStreamIterator) openNextStreamAttempt() (StreamIterator, int, erro
 		}
 		return iter, attempt, nil
 	}
-
 	if lastErr != nil {
-		return nil, 0, fmt.Errorf("max retries exceeded before first stream chunk: %w", lastErr)
+		return zero, 0, fmt.Errorf("max retries exceeded before first stream chunk: %w", lastErr)
 	}
-	return nil, 0, nil
+	return zero, 0, nil
 }
 
-func (r *retryStreamIterator) Chunk() []byte       { return r.inner.Chunk() }
-func (r *retryStreamIterator) Text() string        { return r.inner.Text() }
-func (r *retryStreamIterator) FullText() string    { return r.inner.FullText() }
-func (r *retryStreamIterator) Err() error          { return r.inner.Err() }
-func (r *retryStreamIterator) Usage() *Usage       { return r.inner.Usage() }
-func (r *retryStreamIterator) Response() *Response { return r.inner.Response() }
-func (r *retryStreamIterator) Close() error        { return r.closeOnce.Do(r.inner.Close) }
-func (r *retryStreamIterator) Interrupt(err error) { interruptStreamIterator(r.inner, err) }
-
-type errorIterator struct {
-	err error
+func (r *retryStreamWrapper[Req, StreamResp]) Err() error { return asBaseStream(r.inner).Err() }
+func (r *retryStreamWrapper[Req, StreamResp]) Close() error {
+	return r.closeOnce.Do(func() error { return asBaseStream(r.inner).Close() })
 }
 
-func (e *errorIterator) Next() bool          { return false }
-func (e *errorIterator) Chunk() []byte       { return nil }
-func (e *errorIterator) Text() string        { return "" }
-func (e *errorIterator) FullText() string    { return "" }
-func (e *errorIterator) Err() error          { return e.err }
-func (e *errorIterator) Usage() *Usage       { return nil }
-func (e *errorIterator) Response() *Response { return nil }
-func (e *errorIterator) Close() error        { return nil }
+func (r *retryStreamWrapper[Req, StreamResp]) Chunk() []byte {
+	if si, ok := any(r.inner).(StreamIterator); ok {
+		return si.Chunk()
+	}
+	return nil
+}
+func (r *retryStreamWrapper[Req, StreamResp]) Text() string {
+	if si, ok := any(r.inner).(StreamIterator); ok {
+		return si.Text()
+	}
+	return ""
+}
+func (r *retryStreamWrapper[Req, StreamResp]) FullText() string {
+	if si, ok := any(r.inner).(StreamIterator); ok {
+		return si.FullText()
+	}
+	return ""
+}
+func (r *retryStreamWrapper[Req, StreamResp]) Usage() *Usage {
+	if si, ok := any(r.inner).(StreamIterator); ok {
+		return si.Usage()
+	}
+	return nil
+}
+func (r *retryStreamWrapper[Req, StreamResp]) Response() *Response {
+	if si, ok := any(r.inner).(StreamIterator); ok {
+		return si.Response()
+	}
+	return nil
+}
+func (r *retryStreamWrapper[Req, StreamResp]) Current() ResponseEvent {
+	if rs, ok := any(r.inner).(ResponseStream); ok {
+		return rs.Current()
+	}
+	return ResponseEvent{}
+}
+func (r *retryStreamWrapper[Req, StreamResp]) Interrupt(err error) {
+	if si, ok := any(r.inner).(InterruptibleStreamIterator); ok {
+		si.Interrupt(err)
+	}
+}
 
-// checkContext 检查上下文是否已取消
+type errorBaseStream struct{ err error }
+
+func (e *errorBaseStream) Next() bool             { return false }
+func (e *errorBaseStream) Err() error             { return e.err }
+func (e *errorBaseStream) Close() error           { return nil }
+func (e *errorBaseStream) Chunk() []byte          { return nil }
+func (e *errorBaseStream) Text() string           { return "" }
+func (e *errorBaseStream) FullText() string       { return "" }
+func (e *errorBaseStream) Usage() *Usage          { return nil }
+func (e *errorBaseStream) Response() *Response    { return nil }
+func (e *errorBaseStream) Current() ResponseEvent { return ResponseEvent{} }
+
+func asBaseStream(v any) BaseStream {
+	if bs, ok := v.(BaseStream); ok {
+		return bs
+	}
+	return nil
+}
+
 func checkContext(ctx context.Context, wrapError func(msg string, cause error) error) error {
 	if ctx.Err() != nil {
 		if wrapError != nil {
@@ -259,7 +307,6 @@ func checkContext(ctx context.Context, wrapError func(msg string, cause error) e
 	return nil
 }
 
-// shouldStopRetry 判断是否应该停止重试
 func shouldStopRetry(attempt, maxAttempts int, err error, isRetryable func(error) bool) bool {
 	if attempt >= maxAttempts {
 		return true
@@ -270,7 +317,6 @@ func shouldStopRetry(attempt, maxAttempts int, err error, isRetryable func(error
 	return false
 }
 
-// waitRetry 等待重试间隔
 func waitRetry(ctx context.Context, attempt int, cfg RetryConfig) error {
 	delay := cfg.Backoff(attempt)
 	if delay <= 0 {
