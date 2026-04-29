@@ -4,7 +4,7 @@
 
 SLM 聚焦三件事：
 
-- 协议编解码（OpenAI 兼容 Chat + Responses）
+- 协议编解码（OpenAI Chat + Responses，Claude Messages）
 - 传输抽象（HTTP 或自定义 Transport）
 - 中间件组合（能力协商、观察器、超时、重试、限流、请求 ID）
 
@@ -21,7 +21,8 @@ go get ojv/slm
 ### 1) Chat: 基础调用
 
 ```go
-engine := slm.NewOpenAIProtocol(
+engine := slm.NewEngineWithEndpoint(
+    slm.ProtocolOpenAI,
     "https://api.openai.com/v1",
     "your-api-key",
     "gpt-4o-mini",
@@ -59,10 +60,28 @@ if err := iter.Err(); err != nil {
 }
 ```
 
-### 3) Responses: 一次性创建
+### 3) Claude: 基础调用
 
 ```go
-re := slm.NewOpenAIResponsesProtocol(
+engine := slm.NewEngineWithEndpoint(
+    slm.ProtocolClaude,
+    "https://api.anthropic.com/v1",
+    "your-api-key",
+    "claude-3-5-sonnet-20241022",
+)
+
+resp, err := engine.Generate(ctx, &slm.Request{
+    Messages: []slm.Message{
+        slm.NewTextMessage(slm.RoleUser, "Hello"),
+    },
+})
+```
+
+### 4) Responses: 一次性创建
+
+```go
+re := slm.NewResponsesEngineWithEndpoint(
+    slm.ProtocolOpenAI,
     "https://api.openai.com/v1",
     "your-api-key",
     "gpt-4o-mini",
@@ -85,7 +104,7 @@ for _, item := range resp.Output {
 }
 ```
 
-### 4) 泛型结构化输出
+### 5) 泛型结构化输出
 
 ```go
 type Sentiment struct {
@@ -111,44 +130,36 @@ fmt.Printf("%s %.1f\n", result.Sentiment, result.Score)
 
 SLM 使用协议与传输分离：
 
-- 协议层：`OpenAIEngine` / `OpenAIResponsesEngine` 只做请求体构建、响应解析、SSE 事件处理
+- 协议层：各协议引擎只做请求体构建、响应解析、SSE 事件处理
 - 传输层：`Transport` 只负责 HTTP 通信与认证
-- 组合层：中间件统一处理横切关注点
+- 适配层：`genericAdapter` 通过闭包注入 codec，统一 generate/stream 流程
+- 组合层：泛型中间件管道统一处理横切关注点
 
 ```go
 type Transport interface {
     Do(ctx context.Context, method, path string, headers map[string]string, body []byte) (*http.Response, error)
 }
-
-## 能力目录工具（索引与合并）
-
-当你需要把多个来源（例如 chat 目录、responses 目录）的模型能力汇总为单模型视图时，可以直接使用：
-
-- `IndexModelCapabilities(items)`：将切片转为 `map[model]capabilities`
-- `MergeModelCapabilities(modelID, catalogs...)`：按模型聚合多个目录
-
-```go
-chatIndex := slm.IndexModelCapabilities(chatCatalog)
-respIndex := slm.IndexModelCapabilities(responseCatalog)
-
-merged, ok := slm.MergeModelCapabilities("gpt-4.1", chatIndex, respIndex)
-if !ok {
-    // model not found in any catalog
-    return
-}
-
-// merged.Supports: OR 合并
-// merged.Limits:   各字段取最大值
-// merged.Meta:     首次出现键优先（后续目录不覆盖）
-fmt.Println(merged.Supports, merged.Limits)
 ```
-```
+
+### 协议类型
+
+| 协议 | `ProtocolType` | Chat | Responses |
+|---|---|---|---|
+| OpenAI | `ProtocolOpenAI` | `/chat/completions` | `/responses` |
+| Claude | `ProtocolClaude` | `/messages` | — |
+
+工厂函数：
+
+- `NewEngine(protocol, transport, defaultModel)` — 创建 Chat 引擎
+- `NewEngineWithEndpoint(protocol, baseURL, apiKey, defaultModel)` — 一步创建
+- `NewResponsesEngine(protocol, transport, defaultModel)` — 创建 Responses 引擎
+- `NewResponsesEngineWithEndpoint(protocol, baseURL, apiKey, defaultModel)` — 一步创建
 
 ## Chat 与 Responses 对照
 
 | 维度 | Chat | Responses |
 |---|---|---|
-| 引擎 | `Engine` | `OpenAIResponsesEngine` |
+| 引擎 | `Engine` | `ResponsesEngine` |
 | Unary | `Generate(ctx, *Request)` | `Create(ctx, *ResponseRequest)` |
 | Stream | `Stream(ctx, *Request)` | `Stream(ctx, *ResponseRequest)` |
 | 工具类型 | `[]Tool` | `[]ResponseTool` |
@@ -296,6 +307,28 @@ resolver := slm.NewCatalogCapabilityResolver(loadCatalog, slm.CapabilityCatalogR
 })
 ```
 
+### 能力目录工具（索引与合并）
+
+当你需要把多个来源（例如 chat 目录、responses 目录）的模型能力汇总为单模型视图时，可以直接使用：
+
+- `IndexModelCapabilities(items)`：将切片转为 `map[model]capabilities`
+- `MergeModelCapabilities(modelID, catalogs...)`：按模型聚合多个目录
+
+```go
+chatIndex := slm.IndexModelCapabilities(chatCatalog)
+respIndex := slm.IndexModelCapabilities(responseCatalog)
+
+merged, ok := slm.MergeModelCapabilities("gpt-4.1", chatIndex, respIndex)
+if !ok {
+    return
+}
+
+// merged.Supports: OR 合并
+// merged.Limits:   各字段取最大值
+// merged.Meta:     首次出现键优先（后续目录不覆盖）
+fmt.Println(merged.Supports, merged.Limits)
+```
+
 ## 可观测性与诊断
 
 生命周期观察器统一覆盖 unary + stream：
@@ -400,27 +433,26 @@ go run ./cmd/slm -example basic
 
 ```
 slm/
-├── adapter.go
-├── call.go
-├── capabilities.go
-├── capability_catalog_resolver.go
-├── codec.go
-├── config.go
-├── diagnostics.go
-├── driver_openai.go
-├── errors.go
-├── helper.go
-├── log.go
-├── middleware.go
-├── model.go
-├── observability.go
-├── observability_adapters.go
-├── retry.go
-├── sse_frame.go
-├── sse_reader.go
-├── transport_http.go
-├── types.go
-└── cmd/slm/main.go
+├── adapter.go              # genericAdapter 通用协议适配器
+├── call.go                 # 泛型结构化输出 (Call/StreamCall/SimpleCall)
+├── capabilities.go         # 能力协商与目录解析
+├── config.go               # 配置构建器
+├── diagnostics.go          # 诊断字段提取
+├── driver_claude.go        # Claude Messages 协议驱动
+├── driver_openai.go        # OpenAI Chat + Responses 协议驱动
+├── errors.go               # 错误分类与 LLMError
+├── factory.go              # 引擎工厂 (ProtocolType 路由)
+├── helper.go               # 消息构建、请求规范化、工具函数
+├── log.go                  # 日志辅助
+├── middleware.go            # 泛型中间件管道
+├── model.go                # 模型元数据与目录加载
+├── observability.go        # 生命周期观察器
+├── provider.go             # Provider 标识归一化
+├── retry.go                # 重试中间件（含流式重试）
+├── sse.go                  # SSE 帧解析与流迭代器
+├── transport_http.go       # HTTP Transport 实现
+├── types.go                # 核心类型与接口定义
+└── cmd/slm/main.go         # 示例程序
 ```
 
 ## 设计原则

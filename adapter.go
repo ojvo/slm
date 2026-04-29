@@ -11,12 +11,11 @@ import (
 type requestValidator[Req any] func(Req) error
 type requestBodyBuilder[Req any] func(Req, string, bool) ([]byte, error)
 type responseDecoder[Resp any] func(*http.Response) (Resp, error)
-type streamFactory[StreamResp any] func(*http.Response, *openAICodec) (StreamResp, error)
-type postValidator[Req any] func(*http.Response, Req, string, bool, *openAICodec, *protocolBase) (*http.Response, error)
+type streamFactory[StreamResp any] func(*http.Response) (StreamResp, error)
+type postValidator[Req any] func(*http.Response, Req, string, bool) (*http.Response, error)
 
 type genericAdapter[Req any, Resp any, StreamResp any] struct {
 	base         protocolBase
-	codec        *openAICodec
 	path         string
 	validate     requestValidator[Req]
 	buildBody    requestBodyBuilder[Req]
@@ -52,7 +51,7 @@ func (a *genericAdapter[Req, Resp, StreamResp]) stream(ctx context.Context, req 
 		return zero, llmErrorFromResponse(resp)
 	}
 
-	return a.createStream(resp, a.codec)
+	return a.createStream(resp)
 }
 
 func (a *genericAdapter[Req, Resp, StreamResp]) doRequest(ctx context.Context, req Req, stream bool) (*http.Response, error) {
@@ -78,7 +77,7 @@ func (a *genericAdapter[Req, Resp, StreamResp]) doRequest(ctx context.Context, r
 	}
 
 	if a.postValidate != nil {
-		return a.postValidate(resp, req, model, stream, a.codec, &a.base)
+		return a.postValidate(resp, req, model, stream)
 	}
 
 	return resp, nil
@@ -112,6 +111,51 @@ func validateResponseRequest(req *ResponseRequest) error {
 	return nil
 }
 
+func newChatAdapter(base protocolBase, codec *openAICodec) *genericAdapter[*Request, *Response, StreamIterator] {
+	return &genericAdapter[*Request, *Response, StreamIterator]{
+		base:     base,
+		path:     "/chat/completions",
+		validate: validateChatRequest,
+		buildBody: func(req *Request, model string, stream bool) ([]byte, error) {
+			return codec.BuildChatRequestBody(req, model, stream)
+		},
+		decodeResp: func(resp *http.Response) (*Response, error) {
+			var oaiResp oaiResponse
+			if err := decodeJSONResponse(resp, &oaiResp); err != nil {
+				return nil, err
+			}
+			return codec.ConvertChatResponse(&oaiResp), nil
+		},
+		createStream: func(resp *http.Response) (StreamIterator, error) {
+			return NewSSEReader(resp.Body, codec.ParseChatSSEChunk), nil
+		},
+		postValidate: func(resp *http.Response, req *Request, model string, stream bool) (*http.Response, error) {
+			return chatPostValidate(resp, req, model, stream, codec, &base)
+		},
+	}
+}
+
+func newResponsesAdapter(base protocolBase, codec *openAICodec) *genericAdapter[*ResponseRequest, *ResponseObject, ResponseStream] {
+	return &genericAdapter[*ResponseRequest, *ResponseObject, ResponseStream]{
+		base:     base,
+		path:     "/responses",
+		validate: validateResponseRequest,
+		buildBody: func(req *ResponseRequest, model string, stream bool) ([]byte, error) {
+			return codec.BuildResponsesRequestBody(req, model, stream)
+		},
+		decodeResp: func(resp *http.Response) (*ResponseObject, error) {
+			var decoded oaiResponseObject
+			if err := decodeJSONResponse(resp, &decoded); err != nil {
+				return nil, err
+			}
+			return codec.ConvertResponseObject(&decoded), nil
+		},
+		createStream: func(resp *http.Response) (ResponseStream, error) {
+			return newOpenAIResponseStream(resp, codec), nil
+		},
+	}
+}
+
 func chatPostValidate(resp *http.Response, req *Request, model string, stream bool, codec *openAICodec, base *protocolBase) (*http.Response, error) {
 	if resp.StatusCode != http.StatusBadRequest || req.Reasoning == nil {
 		return resp, nil
@@ -136,45 +180,4 @@ func chatPostValidate(resp *http.Response, req *Request, model string, stream bo
 
 	headers := streamRequestHeaders(stream)
 	return base.doPost(context.Background(), "/chat/completions", headers, fallbackBody)
-}
-
-func newChatAdapter(base protocolBase, codec *openAICodec) *genericAdapter[*Request, *Response, StreamIterator] {
-	return &genericAdapter[*Request, *Response, StreamIterator]{
-		base:      base,
-		codec:     codec,
-		path:      "/chat/completions",
-		validate:  validateChatRequest,
-		buildBody: codec.BuildChatRequestBody,
-		decodeResp: func(resp *http.Response) (*Response, error) {
-			var oaiResp oaiResponse
-			if err := decodeJSONResponse(resp, &oaiResp); err != nil {
-				return nil, err
-			}
-			return codec.ConvertChatResponse(&oaiResp), nil
-		},
-		createStream: func(resp *http.Response, c *openAICodec) (StreamIterator, error) {
-			return NewSSEReader(resp.Body, c.ParseChatSSEChunk), nil
-		},
-		postValidate: chatPostValidate,
-	}
-}
-
-func newResponsesAdapter(base protocolBase, codec *openAICodec) *genericAdapter[*ResponseRequest, *ResponseObject, ResponseStream] {
-	return &genericAdapter[*ResponseRequest, *ResponseObject, ResponseStream]{
-		base:      base,
-		codec:     codec,
-		path:      "/responses",
-		validate:  validateResponseRequest,
-		buildBody: codec.BuildResponsesRequestBody,
-		decodeResp: func(resp *http.Response) (*ResponseObject, error) {
-			var decoded oaiResponseObject
-			if err := decodeJSONResponse(resp, &decoded); err != nil {
-				return nil, err
-			}
-			return codec.ConvertResponseObject(&decoded), nil
-		},
-		createStream: func(resp *http.Response, c *openAICodec) (ResponseStream, error) {
-			return newOpenAIResponseStream(resp, c), nil
-		},
-	}
 }
