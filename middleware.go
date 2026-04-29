@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -377,25 +376,11 @@ func RateLimitMiddlewares(limit float64, burst int) (Middleware, StreamMiddlewar
 }
 
 func RequestIDMiddleware(generator func() string) Middleware {
-	return requestIDMiddleware[*Request, *Response](generator, func(req *Request, id string) *Request {
-		cloned := cloneRequestForMetadata(req)
-		if cloned.Meta == nil {
-			cloned.Meta = make(map[string]any)
-		}
-		cloned.Meta["request_id"] = id
-		return cloned
-	})
+	return requestIDMiddleware[*Request, *Response](generator, setRequestMetaForID)
 }
 
 func RequestIDStreamMiddleware(generator func() string) StreamMiddleware {
-	inner := requestIDStreamMiddleware[*Request, StreamIterator](generator, func(req *Request, id string) *Request {
-		cloned := cloneRequestForMetadata(req)
-		if cloned.Meta == nil {
-			cloned.Meta = make(map[string]any)
-		}
-		cloned.Meta["request_id"] = id
-		return cloned
-	})
+	inner := requestIDStreamMiddleware[*Request, StreamIterator](generator, setRequestMetaForID)
 	return func(next StreamHandler) StreamHandler {
 		wrapped := inner(next)
 		return func(ctx context.Context, req *Request) (StreamIterator, error) {
@@ -737,12 +722,9 @@ func ApplyStandardMiddleware(engine Engine, opts StandardMiddlewareOptions) Engi
 	return &enginePipelineBridge{pipeline: pipeline, engine: engine}
 }
 
-func ApplyStandardResponseMiddleware(engine *OpenAIResponsesEngine, opts StandardMiddlewareOptions) *OpenAIResponsesEngine {
-	pipeline := applyStandardMiddleware(responsesSuite, responseEnginePipelineAdapter{engine}, opts)
-	return &OpenAIResponsesEngine{
-		adapter: engine.adapter,
-		wrapped: &responsesMiddlewareEngine{pipeline: pipeline, inner: engine},
-	}
+func ApplyStandardResponseMiddleware(engine ResponsesEngine, opts StandardMiddlewareOptions) ResponsesEngine {
+	pipeline := applyStandardMiddleware(responsesSuite, responseEnginePipelineAdapter{engine: engine}, opts)
+	return &responsesEngineBridge{pipeline: pipeline, engine: engine}
 }
 
 // -----------------------------------------------------------------------------
@@ -788,12 +770,7 @@ func (b *enginePipelineBridge) Close() {
 	}
 }
 
-type responsesMiddlewareEngine struct {
-	pipeline PipelineEngine[*ResponseRequest, *ResponseObject, ResponseStream]
-	inner    *OpenAIResponsesEngine
-}
-
-type responseEnginePipelineAdapter struct{ engine *OpenAIResponsesEngine }
+type responseEnginePipelineAdapter struct{ engine ResponsesEngine }
 
 func (a responseEnginePipelineAdapter) Generate(ctx context.Context, req *ResponseRequest) (*ResponseObject, error) {
 	return a.engine.Create(ctx, req)
@@ -802,16 +779,28 @@ func (a responseEnginePipelineAdapter) Stream(ctx context.Context, req *Response
 	return a.engine.Stream(ctx, req)
 }
 
-func (m *responsesMiddlewareEngine) create(ctx context.Context, req *ResponseRequest) (*ResponseObject, error) {
-	return m.pipeline.Generate(ctx, req)
+type responsesEngineBridge struct {
+	pipeline PipelineEngine[*ResponseRequest, *ResponseObject, ResponseStream]
+	engine   ResponsesEngine
 }
-func (m *responsesMiddlewareEngine) stream(ctx context.Context, req *ResponseRequest) (ResponseStream, error) {
-	return m.pipeline.Stream(ctx, req)
+
+func (b *responsesEngineBridge) Create(ctx context.Context, req *ResponseRequest) (*ResponseObject, error) {
+	return b.pipeline.Generate(ctx, req)
 }
-func (m *responsesMiddlewareEngine) close() {
-	if closer, ok := m.pipeline.(PipelineCloser); ok {
+func (b *responsesEngineBridge) Stream(ctx context.Context, req *ResponseRequest) (ResponseStream, error) {
+	return b.pipeline.Stream(ctx, req)
+}
+func (b *responsesEngineBridge) Close() error {
+	if closer, ok := b.pipeline.(PipelineCloser); ok {
 		closer.Close()
 	}
+	return nil
+}
+func (b *responsesEngineBridge) Capabilities() *ProtocolCapabilities {
+	if b.engine != nil {
+		return b.engine.Capabilities()
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -849,13 +838,7 @@ func interruptStreamIterator(iter StreamIterator, err error) {
 }
 
 func generateRequestID() string {
-	var buf [64]byte
-	b := buf[:0]
-	b = append(b, "req_"...)
-	b = strconv.AppendInt(b, time.Now().UnixNano(), 10)
-	b = append(b, '_')
-	b = strconv.AppendInt(b, requestCounter.Add(1), 10)
-	return string(b)
+	return generateRequestIDWithPrefix("req")
 }
 
 var requestCounter atomic.Int64

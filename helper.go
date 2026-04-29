@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -106,7 +107,7 @@ func normalizeForOperation[T any](req T, defaultModel string, stream bool,
 	if any(req) == nil {
 		return zero
 	}
-	resolved := resolveRequestedModel(getModel(req), defaultModel)
+	resolved := ResolveRequestedModel(getModel(req), defaultModel)
 	if getStream(req) == stream && getModel(req) == resolved {
 		return req
 	}
@@ -130,8 +131,7 @@ func streamRequestHeaders(stream bool) map[string]string {
 	return map[string]string{"Accept": "text/event-stream"}
 }
 
-// resolveRequestedModel returns the explicit model when provided, else defaultModel.
-func resolveRequestedModel(requestedModel, defaultModel string) string {
+func ResolveRequestedModel(requestedModel, defaultModel string) string {
 	requestedModel = strings.TrimSpace(requestedModel)
 	if requestedModel != "" {
 		return requestedModel
@@ -163,7 +163,7 @@ func decodeJSONResponse(resp *http.Response, out any) error {
 	return nil
 }
 
-func defaultString(value, fallback string) string {
+func DefaultString(value, fallback string) string {
 	if value != "" {
 		return value
 	}
@@ -407,6 +407,11 @@ func extractResponseText(content any) string {
 	}
 }
 
+func isReasoningEffortUnsupported(body []byte) bool {
+	msg := strings.ToLower(string(body))
+	return strings.Contains(msg, "unrecognized request argument") && strings.Contains(msg, "reasoning_effort")
+}
+
 func buildImageContent(p ImagePart) map[string]any {
 	if p.URL == "" && p.Base64 == "" {
 		return nil
@@ -427,75 +432,6 @@ func buildImageContent(p ImagePart) map[string]any {
 	}
 	img["image_url"] = imageURL
 	return img
-}
-
-func convertMessages(messages []Message) []oaiMessage {
-	result := make([]oaiMessage, len(messages))
-	for i, msg := range messages {
-		oaiMsg := oaiMessage{Role: string(msg.Role), Name: msg.Name, ToolCallID: msg.ToolCallID}
-
-		switch len(msg.Content) {
-		case 0:
-			oaiMsg.Content = nil
-		case 1:
-			switch p := msg.Content[0].(type) {
-			case TextPart:
-				oaiMsg.Content = string(p)
-			case ImagePart:
-				if img := buildImageContent(p); img != nil {
-					oaiMsg.Content = []map[string]any{img}
-				}
-			}
-		default:
-			var parts []map[string]any
-			for _, part := range msg.Content {
-				switch p := part.(type) {
-				case TextPart:
-					parts = append(parts, map[string]any{"type": "text", "text": string(p)})
-				case ImagePart:
-					if img := buildImageContent(p); img != nil {
-						parts = append(parts, img)
-					}
-				}
-			}
-			if len(parts) > 0 {
-				oaiMsg.Content = parts
-			}
-		}
-
-		if len(msg.ToolCalls) > 0 {
-			oaiMsg.ToolCalls = make([]oaiToolCall, len(msg.ToolCalls))
-			for k, tc := range msg.ToolCalls {
-				oaiMsg.ToolCalls[k] = oaiToolCall{
-					Index: k,
-					ID:    tc.ID,
-					Type:  tc.Type,
-					Function: struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					}{Name: tc.Name, Arguments: tc.Arguments},
-				}
-			}
-		}
-
-		result[i] = oaiMsg
-	}
-	return result
-}
-
-func convertTools(tools []Tool) []oaiTool {
-	result := make([]oaiTool, len(tools))
-	for i, t := range tools {
-		result[i] = oaiTool{
-			Type: "function",
-			Function: oaiFunction{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.Parameters,
-			},
-		}
-	}
-	return result
 }
 
 func convertResponseInputItems(items []ResponseInputItem) []map[string]any {
@@ -575,4 +511,271 @@ func toMap(v any) map[string]interface{} {
 		return m
 	}
 	return make(map[string]interface{})
+}
+
+//
+
+type MessageStats struct {
+	MultipartMessages int
+	VisionParts       int
+	ToolCalls         int
+	ToolMessages      int
+}
+
+func ScanMessages(messages []Message) MessageStats {
+	var stats MessageStats
+	for _, message := range messages {
+		if len(message.Content) > 1 {
+			stats.MultipartMessages++
+		}
+		if len(message.ToolCalls) > 0 {
+			stats.ToolMessages++
+		}
+		stats.ToolCalls += len(message.ToolCalls)
+		for _, part := range message.Content {
+			if _, ok := part.(ImagePart); ok {
+				stats.VisionParts++
+			}
+		}
+	}
+	return stats
+}
+
+type ResponseInputStats struct {
+	InputItems  int
+	VisionParts int
+}
+
+func ScanResponseInput(input []ResponseInputItem) ResponseInputStats {
+	var stats ResponseInputStats
+	for _, item := range input {
+		stats.InputItems++
+		if parts, ok := item.Content.([]ResponseInputContentPart); ok {
+			for _, p := range parts {
+				if _, ok := p.(ResponseInputImagePart); ok {
+					stats.VisionParts++
+				}
+			}
+		}
+	}
+	return stats
+}
+
+type RequestProfile struct {
+	Intent                string
+	Stream                bool
+	EstimatedPromptTokens int
+	RequestedOutputTokens int
+}
+
+func ChatRequestProfile(req *Request) RequestProfile {
+	profile := RequestProfile{Intent: "general_chat"}
+	if req == nil {
+		return profile
+	}
+	profile.Stream = req.Stream
+	profile.RequestedOutputTokens = chatRequestedOutputTokens(req)
+	profile.EstimatedPromptTokens = estimateChatPromptTokens(req)
+	if ScanMessages(req.Messages).VisionParts > 0 {
+		profile.Intent = "vision"
+		return profile
+	}
+	if len(req.Tools) > 0 {
+		profile.Intent = "tool_calling"
+		return profile
+	}
+	if req.JSONMode {
+		profile.Intent = "structured_output"
+		return profile
+	}
+	if req.Reasoning != nil && strings.TrimSpace(req.Reasoning.Effort) != "" {
+		profile.Intent = "deep_reasoning"
+		return profile
+	}
+	if req.MaxTokens > 0 && req.MaxTokens <= 2048 {
+		profile.Intent = "fast_chat"
+	}
+	return profile
+}
+
+func ResponseRequestProfile(req *ResponseRequest) RequestProfile {
+	profile := RequestProfile{Intent: "general_response"}
+	if req == nil {
+		return profile
+	}
+	profile.Stream = req.Stream
+	profile.RequestedOutputTokens = req.MaxOutputTokens
+	profile.EstimatedPromptTokens = estimateResponsePromptTokens(req)
+	if len(req.Tools) > 0 {
+		profile.Intent = "tool_calling"
+		return profile
+	}
+	if len(req.Capabilities) > 0 {
+		profile.Intent = "structured_output"
+		return profile
+	}
+	if req.Reasoning != nil && strings.TrimSpace(req.Reasoning.Effort) != "" {
+		profile.Intent = "deep_reasoning"
+		return profile
+	}
+	if req.MaxOutputTokens > 0 && req.MaxOutputTokens <= 2048 {
+		profile.Intent = "fast_response"
+	}
+	return profile
+}
+
+func chatRequestedOutputTokens(req *Request) int {
+	if req == nil {
+		return 0
+	}
+	maxTokens := req.MaxTokens
+	if value, ok := intFromMap(req.Capabilities, "max_completion_tokens"); ok && value > maxTokens {
+		maxTokens = value
+	}
+	return maxTokens
+}
+
+func intFromMap(values map[string]any, key string) (int, bool) {
+	if len(values) == 0 {
+		return 0, false
+	}
+	switch value := values[key].(type) {
+	case int:
+		return value, true
+	case int64:
+		return int(value), true
+	case float64:
+		return int(value), true
+	default:
+		return 0, false
+	}
+}
+
+func estimateChatPromptTokens(req *Request) int {
+	if req == nil {
+		return 0
+	}
+	chars := 0
+	for _, message := range req.Messages {
+		chars += len(string(message.Role)) + len(message.Name) + len(message.ToolCallID) + 8
+		for _, part := range message.Content {
+			switch value := part.(type) {
+			case TextPart:
+				chars += len(string(value))
+			case ImagePart:
+				chars += len(value.URL) + len(value.Base64) + len(value.Detail) + len(value.MIME) + 32
+			default:
+				chars += 16
+			}
+		}
+		for _, call := range message.ToolCalls {
+			chars += len(call.ID) + len(call.Type) + len(call.Name) + len(call.Arguments) + 16
+		}
+	}
+	for _, tool := range req.Tools {
+		chars += len(tool.Name) + len(tool.Description) + 64
+		chars += len(renderAny(tool.Parameters))
+	}
+	if req.JSONMode {
+		chars += 32
+	}
+	if req.Reasoning != nil {
+		chars += len(req.Reasoning.Effort) + 16
+	}
+	return estimateTokensFromChars(chars)
+}
+
+func estimateResponsePromptTokens(req *ResponseRequest) int {
+	if req == nil {
+		return 0
+	}
+	chars := 0
+	for _, item := range req.Input {
+		chars += len(item.Role) + len(renderAny(item.Content)) + 8
+	}
+	for _, tool := range req.Tools {
+		chars += len(renderAny(tool))
+	}
+	if req.Reasoning != nil {
+		chars += len(req.Reasoning.Effort) + 16
+	}
+	for key, value := range req.Capabilities {
+		chars += len(key) + len(renderAny(value))
+	}
+	return estimateTokensFromChars(chars)
+}
+
+func renderAny(value any) string {
+	if value == nil {
+		return ""
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func estimateTokensFromChars(chars int) int {
+	if chars <= 0 {
+		return 0
+	}
+	return chars/4 + 1
+}
+
+//
+
+const (
+	RequestIDHeaderCanonical = "X-Request-Id"
+	RequestIDHeaderLegacy    = "X-Request-ID"
+)
+
+// GenerateRequestID returns a process-unique request id with the default "req" prefix.
+func GenerateRequestID() string {
+	return generateRequestIDWithPrefix("req")
+}
+
+// GenerateRequestIDWithPrefix returns a process-unique request id using a custom prefix.
+// Empty or whitespace-only prefixes fall back to "req".
+func GenerateRequestIDWithPrefix(prefix string) string {
+	return generateRequestIDWithPrefix(prefix)
+}
+
+// RequestIDFromHTTP extracts a request id from HTTP headers or generates one.
+//
+// Behavior:
+//   - headerKeys, when provided, are checked in order.
+//   - when headerKeys is empty, defaults are: X-Request-Id, X-Request-ID.
+//   - generate is used as fallback; nil uses GenerateRequestID().
+func RequestIDFromHTTP(r *http.Request, generate func() string, headerKeys ...string) string {
+	if generate == nil {
+		generate = GenerateRequestID
+	}
+	keys := headerKeys
+	if len(keys) == 0 {
+		keys = []string{RequestIDHeaderCanonical, RequestIDHeaderLegacy}
+	}
+	if r != nil {
+		for _, key := range keys {
+			if requestID := strings.TrimSpace(r.Header.Get(key)); requestID != "" {
+				return requestID
+			}
+		}
+	}
+	return strings.TrimSpace(generate())
+}
+
+func generateRequestIDWithPrefix(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = "req"
+	}
+	var buf [64]byte
+	b := buf[:0]
+	b = append(b, prefix...)
+	b = append(b, '_')
+	b = strconv.AppendInt(b, time.Now().UnixNano(), 10)
+	b = append(b, '_')
+	b = strconv.AppendInt(b, requestCounter.Add(1), 10)
+	return string(b)
 }

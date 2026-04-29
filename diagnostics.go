@@ -31,20 +31,7 @@ func RequestDiagnosticFields(req *Request) []any {
 	if req == nil {
 		return []any{"request_nil", true}
 	}
-	multipartMessages := 0
-	visionParts := 0
-	toolCalls := 0
-	for _, message := range req.Messages {
-		if len(message.Content) > 1 {
-			multipartMessages++
-		}
-		toolCalls += len(message.ToolCalls)
-		for _, part := range message.Content {
-			if _, ok := part.(ImagePart); ok {
-				visionParts++
-			}
-		}
-	}
+	stats := ScanMessages(req.Messages)
 	reasoning := ""
 	if req.Reasoning != nil {
 		reasoning = req.Reasoning.Effort
@@ -53,9 +40,9 @@ func RequestDiagnosticFields(req *Request) []any {
 		"model", req.Model,
 		"stream", req.Stream,
 		"messages", len(req.Messages),
-		"multipart_messages", multipartMessages,
-		"vision_parts", visionParts,
-		"tool_calls", toolCalls,
+		"multipart_messages", stats.MultipartMessages,
+		"vision_parts", stats.VisionParts,
+		"tool_calls", stats.ToolCalls,
 		"tools", len(req.Tools),
 		"json_mode", req.JSONMode,
 		"reasoning", reasoning,
@@ -71,16 +58,7 @@ func ResponseRequestDiagnosticFields(req *ResponseRequest) []any {
 	if req == nil {
 		return []any{"request_nil", true}
 	}
-	visionParts := 0
-	for _, item := range req.Input {
-		if parts, ok := item.Content.([]ResponseInputContentPart); ok {
-			for _, p := range parts {
-				if _, isImg := p.(ResponseInputImagePart); isImg {
-					visionParts++
-				}
-			}
-		}
-	}
+	stats := ScanResponseInput(req.Input)
 	reasoning := ""
 	reasoningSummary := ""
 	if req.Reasoning != nil {
@@ -90,8 +68,8 @@ func ResponseRequestDiagnosticFields(req *ResponseRequest) []any {
 	return []any{
 		"model", req.Model,
 		"stream", req.Stream,
-		"input_items", len(req.Input),
-		"vision_parts", visionParts,
+		"input_items", stats.InputItems,
+		"vision_parts", stats.VisionParts,
 		"tools", len(req.Tools),
 		"reasoning", reasoning,
 		"reasoning_summary", reasoningSummary,

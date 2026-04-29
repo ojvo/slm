@@ -75,52 +75,45 @@ func (c Config) WithRateLimit(limit float64, burst int) Config {
 }
 
 // BuildEngineWithTransport 根据配置和 Transport 构建 Engine。
-// 如果配置了 Transport，使用 NewOpenAIWithTransport 创建引擎；
-// 否则使用 ProviderConfig 的 Endpoint/APIKey 创建 HTTP 传输。
 func (c Config) BuildEngineWithTransport() (Engine, error) {
+	if err := c.validateBuildConfig(); err != nil {
+		return nil, err
+	}
 	var engine Engine
 	if c.Transport != nil {
-		if c.Provider.DefaultModel == "" {
-			return nil, NewLLMError(ErrCodeInvalidConfig, "DefaultModel is required when using custom Transport", nil)
-		}
-		engine = NewOpenAIWithTransport(c.Transport, c.Provider.DefaultModel)
+		engine = NewEngine(ProtocolOpenAI, c.Transport, c.Provider.DefaultModel)
 	} else {
-		if c.Provider.Endpoint == "" {
-			return nil, NewLLMError(ErrCodeInvalidConfig, "Endpoint is required when Transport is not set", nil)
-		}
-		if c.Provider.DefaultModel == "" {
-			return nil, NewLLMError(ErrCodeInvalidConfig, "DefaultModel is required", nil)
-		}
-		engine = NewOpenAIProtocol(c.Provider.Endpoint, c.Provider.APIKey, c.Provider.DefaultModel)
+		engine = NewEngineWithEndpoint(ProtocolOpenAI, c.Provider.Endpoint, c.Provider.APIKey, c.Provider.DefaultModel)
 	}
-
 	return c.applyMiddleware(engine), nil
 }
 
-func (c Config) BuildResponsesEngine() (*OpenAIResponsesEngine, error) {
-	var engine *OpenAIResponsesEngine
-	if c.Transport != nil {
-		if c.Provider.DefaultModel == "" {
-			return nil, NewLLMError(ErrCodeInvalidConfig, "DefaultModel is required when using custom Transport", nil)
-		}
-		engine = NewOpenAIResponsesWithTransport(c.Transport, c.Provider.DefaultModel)
-	} else {
-		if c.Provider.Endpoint == "" {
-			return nil, NewLLMError(ErrCodeInvalidConfig, "Endpoint is required when Transport is not set", nil)
-		}
-		if c.Provider.DefaultModel == "" {
-			return nil, NewLLMError(ErrCodeInvalidConfig, "DefaultModel is required", nil)
-		}
-		engine = NewOpenAIResponsesProtocol(c.Provider.Endpoint, c.Provider.APIKey, c.Provider.DefaultModel)
+func (c Config) BuildResponsesEngine() (ResponsesEngine, error) {
+	if err := c.validateBuildConfig(); err != nil {
+		return nil, err
 	}
-
+	var engine ResponsesEngine
+	if c.Transport != nil {
+		engine = NewResponsesEngine(ProtocolOpenAI, c.Transport, c.Provider.DefaultModel)
+	} else {
+		engine = NewResponsesEngineWithEndpoint(ProtocolOpenAI, c.Provider.Endpoint, c.Provider.APIKey, c.Provider.DefaultModel)
+	}
 	return c.applyResponsesMiddleware(engine), nil
 }
 
-// applyMiddleware 统一应用标准中间件
-func (c Config) applyMiddleware(engine Engine) Engine {
+func (c Config) validateBuildConfig() error {
+	if c.Provider.DefaultModel == "" {
+		return NewLLMError(ErrCodeInvalidConfig, "DefaultModel is required", nil)
+	}
+	if c.Transport == nil && c.Provider.Endpoint == "" {
+		return NewLLMError(ErrCodeInvalidConfig, "Endpoint is required when Transport is not set", nil)
+	}
+	return nil
+}
+
+func (c Config) buildMiddlewareOptions() StandardMiddlewareOptions {
 	retry := c.Retry
-	return ApplyStandardMiddleware(engine, StandardMiddlewareOptions{
+	return StandardMiddlewareOptions{
 		DefaultModel:       c.Provider.DefaultModel,
 		Capabilities:       c.resolvedCapabilities(),
 		Observers:          c.Observers,
@@ -131,7 +124,11 @@ func (c Config) applyMiddleware(engine Engine) Engine {
 			Timeout:   c.Timeout,
 			RateLimit: c.RateLimit,
 		},
-	})
+	}
+}
+
+func (c Config) applyMiddleware(engine Engine) Engine {
+	return ApplyStandardMiddleware(engine, c.buildMiddlewareOptions())
 }
 
 func (c Config) resolvedCapabilities() *CapabilityNegotiationOptions {
@@ -145,20 +142,8 @@ func (c Config) resolvedCapabilities() *CapabilityNegotiationOptions {
 	return &clone
 }
 
-func (c Config) applyResponsesMiddleware(engine *OpenAIResponsesEngine) *OpenAIResponsesEngine {
-	retry := c.Retry
-	return ApplyStandardResponseMiddleware(engine, StandardMiddlewareOptions{
-		DefaultModel:       c.Provider.DefaultModel,
-		Capabilities:       c.resolvedCapabilities(),
-		Observers:          c.Observers,
-		EnableRequestID:    c.RequestIDEnabled,
-		RequestIDGenerator: c.RequestIDGenerator,
-		CrossCutting: CrossCuttingMiddlewareOptions{
-			Retry:     &retry,
-			Timeout:   c.Timeout,
-			RateLimit: c.RateLimit,
-		},
-	})
+func (c Config) applyResponsesMiddleware(engine ResponsesEngine) ResponsesEngine {
+	return ApplyStandardResponseMiddleware(engine, c.buildMiddlewareOptions())
 }
 
 type ProviderConfig struct {

@@ -44,8 +44,7 @@ func main() {
 		"    error_handling Error codes and recovery\n"+
 		"    config         Builder pattern configuration\n"+
 		"    custom_http    Custom HTTP client settings\n"+
-		"    capabilities   Explicit model capability negotiation\n"+
-		"    observability  Official metrics/trace observer adapters\n\n"+
+		"    capabilities   Explicit model capability negotiation\n\n"+
 		"  04-PATTERNS (设计模式)\n"+
 		"    conversation  Multi-turn context management\n"+
 		"    batch          Concurrent requests with isolation\n"+
@@ -58,7 +57,6 @@ func main() {
 		"    simple_call    SimpleCall/Chat convenience wrappers\n"+
 		"    full_text      FullText() for reasoning models\n\n"+
 		"  07-INFRASTRUCTURE (基础设施)\n"+
-		"    logging        Logger interface + LogObserver\n"+
 		"    timeout        TimeoutMiddleware for request control\n"+
 		"    request_id     RequestIDMiddleware for tracing\n\n"+
 		"  all             Run all examples sequentially\n")
@@ -90,7 +88,7 @@ func main() {
 		providerCfg.DefaultModel = "gpt-4o-mini"
 	}
 
-	engine := slm.NewOpenAIProtocol(
+	engine := slm.NewEngineWithEndpoint(slm.ProtocolOpenAI,
 		providerCfg.Endpoint,
 		getAPIKey(&providerCfg),
 		providerCfg.DefaultModel,
@@ -128,8 +126,6 @@ func main() {
 		runCustomHTTP(&providerCfg)
 	case "capabilities":
 		runCapabilities(ctx, engine, &providerCfg)
-	case "observability":
-		runObservability(ctx, engine)
 
 	case "conversation":
 		runConversation(ctx, engine)
@@ -150,8 +146,6 @@ func main() {
 	case "full_text":
 		runFullText(ctx, engine)
 
-	case "logging":
-		runLogging(ctx, engine)
 	case "timeout":
 		runTimeout(ctx, engine)
 	case "request_id":
@@ -181,7 +175,6 @@ func runAll(ctx context.Context, engine slm.Engine, providerCfg *slm.ProviderCon
 		{"config", func() { runConfig() }},
 		{"custom_http", func() { runCustomHTTP(providerCfg) }},
 		{"capabilities", func() { runCapabilities(ctx, engine, providerCfg) }},
-		{"observability", func() { runObservability(ctx, engine) }},
 		{"conversation", func() { runConversation(ctx, engine) }},
 		{"batch", func() { runBatch(ctx, engine) }},
 		{"cancel", func() { runCancel(ctx, engine) }},
@@ -190,7 +183,6 @@ func runAll(ctx context.Context, engine slm.Engine, providerCfg *slm.ProviderCon
 		{"few_shot", func() { runFewShot(ctx, engine) }},
 		{"simple_call", func() { runSimpleCall(ctx, engine) }},
 		{"full_text", func() { runFullText(ctx, engine) }},
-		{"logging", func() { runLogging(ctx, engine) }},
 		{"timeout", func() { runTimeout(ctx, engine) }},
 		{"request_id", func() { runRequestID(ctx, engine) }},
 	}
@@ -386,7 +378,7 @@ func runResponses(ctx context.Context, providerCfg *slm.ProviderConfig) {
 	fmt.Println("  RESPONSES: OpenAI Responses API")
 	fmt.Println("========================================")
 
-	baseEngine := slm.NewOpenAIResponsesProtocol(
+	baseEngine := slm.NewResponsesEngineWithEndpoint(slm.ProtocolOpenAI,
 		providerCfg.Endpoint,
 		getAPIKey(providerCfg),
 		"gpt-4o-mini",
@@ -887,7 +879,7 @@ func runCustomHTTP(providerCfg *slm.ProviderConfig) {
 		providerCfg.Endpoint,
 		getAPIKey(providerCfg),
 	)
-	engine := slm.NewOpenAIWithTransport(transport, "gpt-4o-mini")
+	engine := slm.NewEngine(slm.ProtocolOpenAI, transport, "gpt-4o-mini")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -940,7 +932,7 @@ func runCapabilities(ctx context.Context, engine slm.Engine, providerCfg *slm.Pr
 	fmt.Println("  1. Static model capability table")
 	fmt.Println("  2. Generic slm fallback for unknown models")
 
-	base := slm.NewOpenAIProtocol(
+	base := slm.NewEngineWithEndpoint(slm.ProtocolOpenAI,
 		providerCfg.Endpoint,
 		getAPIKey(providerCfg),
 		providerCfg.DefaultModel,
@@ -952,7 +944,6 @@ func runCapabilities(ctx context.Context, engine slm.Engine, providerCfg *slm.Pr
 			DefaultModel: "gpt-4o-mini",
 			RequireKnown: true,
 		},
-		Observers: []slm.LifecycleObserver{capabilityPrinterObserver{}},
 	})
 
 	fmt.Println("--- Preflight reject before provider call ---")
@@ -985,172 +976,6 @@ func runCapabilities(ctx context.Context, engine slm.Engine, providerCfg *slm.Pr
 
 	fmt.Printf("Response: %s\n", resp.Content)
 	fmt.Println("✓ Request was preflight-validated against explicit model capabilities")
-}
-
-func runObservability(ctx context.Context, engine slm.Engine) {
-	fmt.Println("========================================")
-	fmt.Println("  OBSERVABILITY: Metrics + Trace Adapters")
-	fmt.Println("========================================")
-
-	now := time.Date(2026, 4, 24, 12, 0, 0, 0, time.UTC)
-	refreshes := 0
-	resolver := slm.NewCatalogCapabilityResolver(func(context.Context) ([]slm.ModelCapabilities, error) {
-		refreshes++
-		if refreshes == 1 {
-			return []slm.ModelCapabilities{{
-				Model:    "gpt-4o-mini",
-				Supports: slm.CapabilitySet{JSONMode: true, ToolCalls: true, Vision: true, Reasoning: true},
-			}}, nil
-		}
-		return nil, fmt.Errorf("demo catalog refresh failed")
-	}, slm.CapabilityCatalogResolverOptions{
-		CacheTTL:          time.Minute,
-		Now:               func() time.Time { return now },
-		AllowStaleOnError: true,
-	})
-	if _, _, err := resolver.ResolveCapabilities(ctx, "gpt-4o-mini"); err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-	now = now.Add(2 * time.Minute)
-
-	meter := &exampleMeter{}
-	tracer := &exampleTracer{}
-	wrapped := slm.ApplyStandardMiddleware(engine, slm.StandardMiddlewareOptions{
-		EnableRequestID:    true,
-		RequestIDGenerator: func() string { return "demo_observe_req" },
-		Capabilities: &slm.CapabilityNegotiationOptions{
-			Resolver:     resolver,
-			DefaultModel: "gpt-4o-mini",
-		},
-		Observers: []slm.LifecycleObserver{
-			slm.NewMetricsObserver(meter, slm.MetricsObserverOptions{Namespace: "demo"}),
-			slm.NewTraceObserver(tracer, slm.TraceObserverOptions{SpanPrefix: "demo"}),
-		},
-	})
-
-	resp, err := wrapped.Generate(ctx, &slm.Request{
-		Model:    "gpt-4o-mini",
-		JSONMode: true,
-		Messages: []slm.Message{slm.NewTextMessage(slm.RoleUser, "Return valid JSON: {\"status\":\"ok\"}")},
-	})
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Response: %s\n", resp.Content)
-	fmt.Println("Simulated capability catalog: refresh expired, reload failed, stale fallback remained available")
-	fmt.Println("\nMetrics:")
-	for _, line := range meter.lines {
-		fmt.Printf("  %s\n", line)
-	}
-	fmt.Println("  note: capability negotiation attributes now show capabilities.source=catalog, capabilities.known=true, and capabilities.stale=true")
-	fmt.Println("\nSpans:")
-	for _, line := range tracer.lines {
-		fmt.Printf("  %s\n", line)
-	}
-}
-
-type capabilityPrinterObserver struct{}
-
-func (capabilityPrinterObserver) OnRequestStart(_ context.Context, event slm.LifecycleEvent) {
-	if negotiated, ok := slm.GetNegotiatedCapabilities(event.Context); ok {
-		refreshedAt := ""
-		if !negotiated.State.RefreshedAt.IsZero() {
-			refreshedAt = negotiated.State.RefreshedAt.Format(time.RFC3339)
-		}
-		fmt.Printf("Negotiated model=%s requested=%+v supported=%+v known=%v source=%s refreshed_at=%s stale=%v\n", negotiated.Model, negotiated.Requested, negotiated.Supported, negotiated.Known, negotiated.State.Source, refreshedAt, negotiated.Stale)
-	}
-}
-
-func (capabilityPrinterObserver) OnRequestFinish(context.Context, slm.LifecycleEvent)   {}
-func (capabilityPrinterObserver) OnStreamStart(context.Context, slm.LifecycleEvent)     {}
-func (capabilityPrinterObserver) OnStreamConnected(context.Context, slm.LifecycleEvent) {}
-func (capabilityPrinterObserver) OnStreamFinish(context.Context, slm.LifecycleEvent)    {}
-
-type exampleMeter struct {
-	mu    sync.Mutex
-	lines []string
-}
-
-type exampleCounter struct {
-	meter *exampleMeter
-	name  string
-}
-
-type exampleHistogram struct {
-	meter *exampleMeter
-	name  string
-}
-
-func (m *exampleMeter) Int64Counter(name, description, unit string) slm.Int64Counter {
-	return &exampleCounter{meter: m, name: name}
-}
-
-func (m *exampleMeter) Float64Histogram(name, description, unit string) slm.Float64Histogram {
-	return &exampleHistogram{meter: m, name: name}
-}
-
-func (c *exampleCounter) Add(_ context.Context, value int64, attrs ...slm.Attribute) {
-	c.meter.record(fmt.Sprintf("counter %s += %d %s", c.name, value, formatAttributes(attrs)))
-}
-
-func (h *exampleHistogram) Record(_ context.Context, value float64, attrs ...slm.Attribute) {
-	h.meter.record(fmt.Sprintf("histogram %s = %.3f %s", h.name, value, formatAttributes(attrs)))
-}
-
-func (m *exampleMeter) record(line string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.lines = append(m.lines, line)
-}
-
-type exampleTracer struct {
-	mu    sync.Mutex
-	lines []string
-}
-
-type exampleSpan struct {
-	tracer *exampleTracer
-	name   string
-	attrs  []slm.Attribute
-	errors []error
-}
-
-func (t *exampleTracer) Start(ctx context.Context, name string, attrs ...slm.Attribute) (context.Context, slm.Span) {
-	return ctx, &exampleSpan{tracer: t, name: name, attrs: append([]slm.Attribute(nil), attrs...)}
-}
-
-func (s *exampleSpan) SetAttributes(attrs ...slm.Attribute) {
-	s.attrs = append(s.attrs, attrs...)
-}
-
-func (s *exampleSpan) RecordError(err error) {
-	if err != nil {
-		s.errors = append(s.errors, err)
-	}
-}
-
-func (s *exampleSpan) End() {
-	line := fmt.Sprintf("span %s attrs=%s", s.name, formatAttributes(s.attrs))
-	if len(s.errors) > 0 {
-		line += fmt.Sprintf(" errors=%d", len(s.errors))
-	}
-	s.tracer.mu.Lock()
-	defer s.tracer.mu.Unlock()
-	s.tracer.lines = append(s.tracer.lines, line)
-}
-
-func formatAttributes(attrs []slm.Attribute) string {
-	if len(attrs) == 0 {
-		return "{}"
-	}
-	parts := make([]string, 0, len(attrs))
-	for _, attr := range attrs {
-		parts = append(parts, fmt.Sprintf("%s=%v", attr.Key, attr.Value))
-	}
-	return "{" + strings.Join(parts, ", ") + "}"
 }
 
 // ============================================================
@@ -1567,68 +1392,6 @@ Show your work.`),
 // ============================================================
 // 07-INFRASTRUCTURE: 基础设施示例（Logger/Timeout/RequestID）
 // ============================================================
-
-type MyLogger struct {
-	prefix string
-}
-
-func (l *MyLogger) formatArgs(args ...any) string {
-	if len(args) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	for i := 0; i < len(args); i += 2 {
-		if i+1 < len(args) {
-			b.WriteString(fmt.Sprintf(" %v=%v", args[i], args[i+1]))
-		}
-	}
-	return b.String()
-}
-
-func (l *MyLogger) Info(msg string, args ...any) {
-	fmt.Printf("[INFO] %s %s%s\n", l.prefix, msg, l.formatArgs(args...))
-}
-func (l *MyLogger) Debug(msg string, args ...any) {
-	fmt.Printf("[DEBUG] %s %s%s\n", l.prefix, msg, l.formatArgs(args...))
-}
-func (l *MyLogger) Warn(msg string, args ...any) {
-	fmt.Printf("[WARN] %s %s%s\n", l.prefix, msg, l.formatArgs(args...))
-}
-func (l *MyLogger) Error(msg string, args ...any) {
-	fmt.Printf("[ERROR] %s %s%s\n", l.prefix, msg, l.formatArgs(args...))
-}
-
-func runLogging(ctx context.Context, engine slm.Engine) {
-	fmt.Println("========================================")
-	fmt.Println("  LOGGING: Logger Interface + Middleware")
-	fmt.Println("========================================")
-
-	logger := &MyLogger{prefix: "LLM"}
-
-	wrapped := slm.ApplyStandardMiddleware(engine, slm.StandardMiddlewareOptions{
-		Observers: []slm.LifecycleObserver{slm.NewLogObserver(logger)},
-	})
-
-	fmt.Println("--- Request with automatic logging ---")
-
-	resp, err := wrapped.Generate(ctx, &slm.Request{
-		Model: "gpt-4o-mini",
-		Messages: []slm.Message{
-			slm.NewTextMessage(slm.RoleUser, "Say 'Hello World'"),
-		},
-	})
-
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-
-	fmt.Printf("\nResponse: %s\n", resp.Content)
-	fmt.Printf("\n✅ All LLM requests are now automatically logged!\n")
-	fmt.Println("   - Request start time and model")
-	fmt.Println("   - Response duration and token usage")
-	fmt.Println("   - Error details if any failure")
-}
 
 func runTimeout(ctx context.Context, engine slm.Engine) {
 	fmt.Println("========================================")

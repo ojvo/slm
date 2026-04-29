@@ -134,8 +134,53 @@ func retryMiddlewareWithConfig[Req any, Resp any, StreamResp any](
 	return unary, stream
 }
 
+type streamAccessor struct {
+	base          BaseStream
+	iterator      StreamIterator
+	respStream    ResponseStream
+	interruptible InterruptibleStreamIterator
+}
+
+func resolveStreamAccessor(v any) streamAccessor {
+	return streamAccessor{
+		base:          asBaseStream(v),
+		iterator:      asStreamIterator(v),
+		respStream:    asResponseStream(v),
+		interruptible: asInterruptibleStream(v),
+	}
+}
+
+func asBaseStream(v any) BaseStream {
+	if bs, ok := v.(BaseStream); ok {
+		return bs
+	}
+	return nil
+}
+
+func asStreamIterator(v any) StreamIterator {
+	if si, ok := v.(StreamIterator); ok {
+		return si
+	}
+	return nil
+}
+
+func asResponseStream(v any) ResponseStream {
+	if rs, ok := v.(ResponseStream); ok {
+		return rs
+	}
+	return nil
+}
+
+func asInterruptibleStream(v any) InterruptibleStreamIterator {
+	if si, ok := v.(InterruptibleStreamIterator); ok {
+		return si
+	}
+	return nil
+}
+
 type retryStreamWrapper[Req any, StreamResp any] struct {
 	inner               StreamResp
+	accessor            streamAccessor
 	ctx                 context.Context
 	req                 Req
 	next                PipelineStreamHandler[Req, StreamResp]
@@ -155,8 +200,7 @@ func newRetryStreamWrapper[Req any, StreamResp any](
 	inner StreamResp,
 	attempt int,
 ) *retryStreamWrapper[Req, StreamResp] {
-	return &retryStreamWrapper[Req, StreamResp]{
-		inner:    inner,
+	w := &retryStreamWrapper[Req, StreamResp]{
 		ctx:      ctx,
 		req:      req,
 		next:     next,
@@ -164,12 +208,18 @@ func newRetryStreamWrapper[Req any, StreamResp any](
 		cloneReq: cloneReq,
 		attempt:  attempt,
 	}
+	w.setInner(inner)
+	return w
+}
+
+func (r *retryStreamWrapper[Req, StreamResp]) setInner(inner StreamResp) {
+	r.inner = inner
+	r.accessor = resolveStreamAccessor(inner)
 }
 
 func (r *retryStreamWrapper[Req, StreamResp]) Next() bool {
-	stream := asBaseStream(r.inner)
 	if r.firstChunkDelivered {
-		ok := stream.Next()
+		ok := r.accessor.base.Next()
 		if !ok {
 			_ = r.Close()
 		}
@@ -179,13 +229,12 @@ func (r *retryStreamWrapper[Req, StreamResp]) Next() bool {
 }
 
 func (r *retryStreamWrapper[Req, StreamResp]) nextUntilFirstChunk() bool {
-	stream := asBaseStream(r.inner)
 	for {
-		if stream.Next() {
+		if r.accessor.base.Next() {
 			r.firstChunkDelivered = true
 			return true
 		}
-		err := stream.Err()
+		err := r.accessor.base.Err()
 		if err == nil {
 			_ = r.Close()
 			return false
@@ -193,13 +242,13 @@ func (r *retryStreamWrapper[Req, StreamResp]) nextUntilFirstChunk() bool {
 		if shouldStopRetry(r.attempt, r.cfg.MaxAttempts, err, r.cfg.IsRetryable) {
 			return false
 		}
-		stream.Close()
-		iter, attempt, err := r.openNextAttempt()
-		if err != nil {
-			r.inner = any(&errorBaseStream{err: err}).(StreamResp)
+		r.accessor.base.Close()
+		iter, attempt, retryErr := r.openNextAttempt()
+		if retryErr != nil {
+			r.setInner(any(&errorBaseStream{err: retryErr}).(StreamResp))
 			return false
 		}
-		r.inner = iter
+		r.setInner(iter)
 		r.attempt = attempt
 	}
 }
@@ -231,50 +280,50 @@ func (r *retryStreamWrapper[Req, StreamResp]) openNextAttempt() (StreamResp, int
 	return zero, 0, nil
 }
 
-func (r *retryStreamWrapper[Req, StreamResp]) Err() error { return asBaseStream(r.inner).Err() }
+func (r *retryStreamWrapper[Req, StreamResp]) Err() error { return r.accessor.base.Err() }
 func (r *retryStreamWrapper[Req, StreamResp]) Close() error {
-	return r.closeOnce.Do(func() error { return asBaseStream(r.inner).Close() })
+	return r.closeOnce.Do(func() error { return r.accessor.base.Close() })
 }
 
 func (r *retryStreamWrapper[Req, StreamResp]) Chunk() []byte {
-	if si, ok := any(r.inner).(StreamIterator); ok {
-		return si.Chunk()
+	if r.accessor.iterator != nil {
+		return r.accessor.iterator.Chunk()
 	}
 	return nil
 }
 func (r *retryStreamWrapper[Req, StreamResp]) Text() string {
-	if si, ok := any(r.inner).(StreamIterator); ok {
-		return si.Text()
+	if r.accessor.iterator != nil {
+		return r.accessor.iterator.Text()
 	}
 	return ""
 }
 func (r *retryStreamWrapper[Req, StreamResp]) FullText() string {
-	if si, ok := any(r.inner).(StreamIterator); ok {
-		return si.FullText()
+	if r.accessor.iterator != nil {
+		return r.accessor.iterator.FullText()
 	}
 	return ""
 }
 func (r *retryStreamWrapper[Req, StreamResp]) Usage() *Usage {
-	if si, ok := any(r.inner).(StreamIterator); ok {
-		return si.Usage()
+	if r.accessor.iterator != nil {
+		return r.accessor.iterator.Usage()
 	}
 	return nil
 }
 func (r *retryStreamWrapper[Req, StreamResp]) Response() *Response {
-	if si, ok := any(r.inner).(StreamIterator); ok {
-		return si.Response()
+	if r.accessor.iterator != nil {
+		return r.accessor.iterator.Response()
 	}
 	return nil
 }
 func (r *retryStreamWrapper[Req, StreamResp]) Current() ResponseEvent {
-	if rs, ok := any(r.inner).(ResponseStream); ok {
-		return rs.Current()
+	if r.accessor.respStream != nil {
+		return r.accessor.respStream.Current()
 	}
 	return ResponseEvent{}
 }
 func (r *retryStreamWrapper[Req, StreamResp]) Interrupt(err error) {
-	if si, ok := any(r.inner).(InterruptibleStreamIterator); ok {
-		si.Interrupt(err)
+	if r.accessor.interruptible != nil {
+		r.accessor.interruptible.Interrupt(err)
 	}
 }
 
@@ -289,13 +338,6 @@ func (e *errorBaseStream) FullText() string       { return "" }
 func (e *errorBaseStream) Usage() *Usage          { return nil }
 func (e *errorBaseStream) Response() *Response    { return nil }
 func (e *errorBaseStream) Current() ResponseEvent { return ResponseEvent{} }
-
-func asBaseStream(v any) BaseStream {
-	if bs, ok := v.(BaseStream); ok {
-		return bs
-	}
-	return nil
-}
 
 func checkContext(ctx context.Context, wrapError func(msg string, cause error) error) error {
 	if ctx.Err() != nil {

@@ -12,7 +12,7 @@ import (
 )
 
 // HTTPTransport 通过标准 HTTP + Bearer token 通信的 Transport 实现。
-// 这是从 BaseEngine 提取的传输层，与 OpenAIEngine 的协议层解耦。
+// 这是从引擎提取的传输层，与协议层解耦。
 type HTTPTransport struct {
 	Client      *http.Client
 	BaseURL     string

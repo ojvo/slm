@@ -39,6 +39,7 @@ type Model struct {
 func (m Model) ToCapabilities() ModelCapabilities {
 	return ModelCapabilities{
 		Model:    m.ID,
+		Provider: m.OwnedBy,
 		Supports: m.Capabilities,
 		Limits:   m.Limits,
 		Meta:     cloneMap(m.Meta),
@@ -69,28 +70,11 @@ func (r ModelsResponse) ToCapabilities() []ModelCapabilities {
 	return caps
 }
 
-type ModelInfo struct {
-	ID           string
-	OwnedBy      string
-	Capabilities CapabilitySet
-	Limits       ModelLimits
-	Endpoints    []string
-	CreatedAt    time.Time
-}
-
-func (m Model) Info() ModelInfo {
-	var createdAt time.Time
+func (m Model) CreatedAt() time.Time {
 	if m.Created > 0 {
-		createdAt = time.Unix(m.Created, 0)
+		return time.Unix(m.Created, 0)
 	}
-	return ModelInfo{
-		ID:           m.ID,
-		OwnedBy:      m.OwnedBy,
-		Capabilities: m.Capabilities,
-		Limits:       m.Limits,
-		Endpoints:    cloneStringSlice(m.SupportedEndpoints),
-		CreatedAt:    createdAt,
-	}
+	return time.Time{}
 }
 
 func ModelsResponseToCatalogLoader(resp ModelsResponse) CapabilityCatalogLoader {

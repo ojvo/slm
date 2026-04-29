@@ -2,7 +2,6 @@ package slm
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -71,14 +70,6 @@ type Message struct {
 // Chat Request / Response Model
 // -----------------------------------------------------------------------------
 
-type RequestIdentity struct {
-	Model        string         `json:"model"`
-	Meta         map[string]any `json:"meta,omitempty"`
-	Capabilities map[string]any `json:"capabilities,omitempty"`
-}
-
-func (r RequestIdentity) GetModel() string { return r.Model }
-
 // Request is the package-level request model for the chat/completions path.
 // It is also the primary request shape consumed by the Engine interface.
 type Request struct {
@@ -103,41 +94,11 @@ type Request struct {
 
 func (r *Request) GetModel() string { return r.Model }
 
-// ValidateFor checks if this request's capabilities are supported by the engine.
-// Returns an error if unsupported parameters are used or conflicting parameters are specified.
 func (r *Request) ValidateFor(engine Engine) error {
 	if engine == nil {
 		return NewLLMError(ErrCodeInvalidConfig, "engine is nil", nil)
 	}
-	caps := engine.Capabilities()
-	if caps == nil {
-		return nil // Engine doesn't declare capabilities (fallback mode)
-	}
-
-	// Check for unsupported parameters
-	for param := range r.Capabilities {
-		if _, supported := caps.SupportedParameters[param]; !supported {
-			return NewLLMError(ErrCodeInvalidConfig,
-				fmt.Sprintf("parameter %q not supported by this protocol", param), nil)
-		}
-	}
-
-	// Check for conflicting parameters
-	for _, conflict := range caps.ConflictingParameters {
-		count := 0
-		var present []string
-		for _, param := range conflict {
-			if _, exists := r.Capabilities[param]; exists {
-				count++
-				present = append(present, param)
-			}
-		}
-		if count > 1 {
-			return NewLLMError(ErrCodeInvalidConfig,
-				fmt.Sprintf("conflicting parameters cannot be used together: %v", present), nil)
-		}
-	}
-	return nil
+	return ValidateCapabilities(r.Capabilities, engine.Capabilities(), "this protocol")
 }
 
 // Response is the normalized chat response returned by Engine.
@@ -233,41 +194,11 @@ type ResponseRequest struct {
 
 func (r *ResponseRequest) GetModel() string { return r.Model }
 
-// ValidateFor checks if this response request's capabilities are supported by the engine.
-// Returns an error if unsupported parameters are used or conflicting parameters are specified.
-func (r *ResponseRequest) ValidateFor(engine *OpenAIResponsesEngine) error {
+func (r *ResponseRequest) ValidateFor(engine ResponsesEngine) error {
 	if engine == nil {
 		return NewLLMError(ErrCodeInvalidConfig, "engine is nil", nil)
 	}
-	caps := engine.Capabilities()
-	if caps == nil {
-		return nil // Engine doesn't declare capabilities (fallback mode)
-	}
-
-	// Check for unsupported parameters
-	for param := range r.Capabilities {
-		if _, supported := caps.SupportedParameters[param]; !supported {
-			return NewLLMError(ErrCodeInvalidConfig,
-				fmt.Sprintf("parameter %q not supported by Responses API", param), nil)
-		}
-	}
-
-	// Check for conflicting parameters
-	for _, conflict := range caps.ConflictingParameters {
-		count := 0
-		var present []string
-		for _, param := range conflict {
-			if _, exists := r.Capabilities[param]; exists {
-				count++
-				present = append(present, param)
-			}
-		}
-		if count > 1 {
-			return NewLLMError(ErrCodeInvalidConfig,
-				fmt.Sprintf("conflicting parameters cannot be used together: %v", present), nil)
-		}
-	}
-	return nil
+	return ValidateCapabilities(r.Capabilities, engine.Capabilities(), "Responses API")
 }
 
 // ResponseOutputContent is one content block in a /responses output item.
@@ -355,7 +286,7 @@ type ResponseStream interface {
 // -----------------------------------------------------------------------------
 
 // Transport 抽象 LLM API 的 HTTP 通信层。
-// OpenAIEngine 只负责 OpenAI 协议的编解码，实际的 HTTP 通信和认证
+// 引擎只负责协议的编解码，实际的 HTTP 通信和认证
 // 由 Transport 实现。这使得同一个协议引擎可以搭配不同的传输方式：
 //   - HTTPTransport: 标准 Bearer token + HTTP 直连
 //   - CopilotTransport: GitHub OAuth + token 自动刷新
@@ -390,77 +321,23 @@ type streamIteratorWrapper struct {
 	inner StreamIterator
 }
 
-func (w *streamIteratorWrapper) Chunk() []byte {
-	if w.inner != nil {
-		return w.inner.Chunk()
-	}
-	return nil
-}
-func (w *streamIteratorWrapper) Text() string {
-	if w.inner != nil {
-		return w.inner.Text()
-	}
-	return ""
-}
-func (w *streamIteratorWrapper) FullText() string {
-	if w.inner != nil {
-		return w.inner.FullText()
-	}
-	return ""
-}
-func (w *streamIteratorWrapper) Err() error {
-	if w.inner != nil {
-		return w.inner.Err()
-	}
-	return nil
-}
-func (w *streamIteratorWrapper) Usage() *Usage {
-	if w.inner != nil {
-		return w.inner.Usage()
-	}
-	return nil
-}
-func (w *streamIteratorWrapper) Response() *Response {
-	if w.inner != nil {
-		return w.inner.Response()
-	}
-	return nil
-}
-func (w *streamIteratorWrapper) Close() error {
-	if w.inner != nil {
-		return w.inner.Close()
-	}
-	return nil
-}
+func (w *streamIteratorWrapper) Next() bool          { return w.inner.Next() }
+func (w *streamIteratorWrapper) Chunk() []byte       { return w.inner.Chunk() }
+func (w *streamIteratorWrapper) Text() string        { return w.inner.Text() }
+func (w *streamIteratorWrapper) FullText() string    { return w.inner.FullText() }
+func (w *streamIteratorWrapper) Err() error          { return w.inner.Err() }
+func (w *streamIteratorWrapper) Usage() *Usage       { return w.inner.Usage() }
+func (w *streamIteratorWrapper) Response() *Response { return w.inner.Response() }
+func (w *streamIteratorWrapper) Close() error        { return w.inner.Close() }
 
 type responseStreamWrapper struct {
 	inner ResponseStream
 }
 
-func (w *responseStreamWrapper) Next() bool {
-	if w.inner != nil {
-		return w.inner.Next()
-	}
-	return false
-}
-func (w *responseStreamWrapper) Current() ResponseEvent {
-	if w.inner != nil {
-		return w.inner.Current()
-	}
-	return ResponseEvent{}
-}
-func (w *responseStreamWrapper) Err() error {
-	if w.inner != nil {
-		return w.inner.Err()
-	}
-	return nil
-}
-func (w *responseStreamWrapper) Close() error {
-	if w.inner != nil {
-		return w.inner.Close()
-	}
-	return nil
-}
+func (w *responseStreamWrapper) Next() bool             { return w.inner.Next() }
+func (w *responseStreamWrapper) Current() ResponseEvent { return w.inner.Current() }
+func (w *responseStreamWrapper) Err() error             { return w.inner.Err() }
+func (w *responseStreamWrapper) Close() error           { return w.inner.Close() }
 
 // ParameterRange describes valid values or bounds for a protocol parameter.
 type ParameterRange struct {
@@ -538,7 +415,7 @@ type protocolBase struct {
 }
 
 func (b *protocolBase) resolveModel(model string) (string, error) {
-	m := resolveRequestedModel(model, b.defaultModel)
+	m := ResolveRequestedModel(model, b.defaultModel)
 	if m == "" {
 		return "", NewLLMError(ErrCodeInvalidModel, "model is required", nil)
 	}

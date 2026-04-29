@@ -119,6 +119,29 @@ SLM 使用协议与传输分离：
 type Transport interface {
     Do(ctx context.Context, method, path string, headers map[string]string, body []byte) (*http.Response, error)
 }
+
+## 能力目录工具（索引与合并）
+
+当你需要把多个来源（例如 chat 目录、responses 目录）的模型能力汇总为单模型视图时，可以直接使用：
+
+- `IndexModelCapabilities(items)`：将切片转为 `map[model]capabilities`
+- `MergeModelCapabilities(modelID, catalogs...)`：按模型聚合多个目录
+
+```go
+chatIndex := slm.IndexModelCapabilities(chatCatalog)
+respIndex := slm.IndexModelCapabilities(responseCatalog)
+
+merged, ok := slm.MergeModelCapabilities("gpt-4.1", chatIndex, respIndex)
+if !ok {
+    // model not found in any catalog
+    return
+}
+
+// merged.Supports: OR 合并
+// merged.Limits:   各字段取最大值
+// merged.Meta:     首次出现键优先（后续目录不覆盖）
+fmt.Println(merged.Supports, merged.Limits)
+```
 ```
 
 ## Chat 与 Responses 对照

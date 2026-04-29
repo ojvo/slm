@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
+	"sync"
 )
 
 var openAIChatCapabilitiesTemplate = ProtocolCapabilities{
@@ -32,39 +32,24 @@ var openAIResponsesCapabilitiesTemplate = ProtocolCapabilities{
 // OpenAI Chat Completions Driver
 // -----------------------------------------------------------------------------
 
-// OpenAIEngine OpenAI 协议驱动。
-// 只负责 OpenAI 协议的编解码，HTTP 通信和认证由 Transport 实现。
-
-type OpenAIEngine struct {
+type openAIEngine struct {
 	adapter *genericAdapter[*Request, *Response, StreamIterator]
 }
 
-// NewOpenAIProtocol 创建 OpenAI 协议引擎（使用标准 HTTP 传输）。
-func NewOpenAIProtocol(baseURL, apiKey, defaultModel string) Engine {
-	return NewOpenAIEngine(NewHTTPTransport(baseURL, apiKey), defaultModel)
-}
-
-// NewOpenAIEngine 创建 OpenAI 协议引擎（使用自定义 Transport）。
-func NewOpenAIEngine(transport Transport, defaultModel string) Engine {
+func newOpenAIEngine(transport Transport, defaultModel string) Engine {
 	base := protocolBase{transport: transport, defaultModel: defaultModel}
-	return &OpenAIEngine{adapter: newChatAdapter(base, openaiCodec)}
+	return &openAIEngine{adapter: newChatAdapter(base, openaiCodec)}
 }
 
-// 已弃用：使用 NewOpenAIEngine 代替。
-func NewOpenAIWithTransport(transport Transport, defaultModel string) Engine {
-	return NewOpenAIEngine(transport, defaultModel)
-}
-
-func (e *OpenAIEngine) Generate(ctx context.Context, req *Request) (*Response, error) {
+func (e *openAIEngine) Generate(ctx context.Context, req *Request) (*Response, error) {
 	return e.adapter.generate(ctx, req)
 }
 
-func (e *OpenAIEngine) Stream(ctx context.Context, req *Request) (StreamIterator, error) {
+func (e *openAIEngine) Stream(ctx context.Context, req *Request) (StreamIterator, error) {
 	return e.adapter.stream(ctx, req)
 }
 
-// Capabilities returns the protocol capabilities supported by OpenAI Chat Completions API.
-func (e *OpenAIEngine) Capabilities() *ProtocolCapabilities {
+func (e *openAIEngine) Capabilities() *ProtocolCapabilities {
 	return cloneProtocolCapabilities(openAIChatCapabilitiesTemplate)
 }
 
@@ -72,48 +57,28 @@ func (e *OpenAIEngine) Capabilities() *ProtocolCapabilities {
 // OpenAI Responses Driver
 // -----------------------------------------------------------------------------
 
-type OpenAIResponsesEngine struct {
+type openAIResponsesEngine struct {
 	adapter *genericAdapter[*ResponseRequest, *ResponseObject, ResponseStream]
-	wrapped *responsesMiddlewareEngine
 }
 
-func NewOpenAIResponsesProtocol(baseURL, apiKey, defaultModel string) *OpenAIResponsesEngine {
-	return NewOpenAIResponsesEngine(NewHTTPTransport(baseURL, apiKey), defaultModel)
-}
-
-// NewOpenAIResponsesEngine 创建 Responses API 引擎（使用自定义 Transport）。
-func NewOpenAIResponsesEngine(transport Transport, defaultModel string) *OpenAIResponsesEngine {
+func newOpenAIResponsesEngine(transport Transport, defaultModel string) ResponsesEngine {
 	base := protocolBase{transport: transport, defaultModel: defaultModel}
-	return &OpenAIResponsesEngine{adapter: newResponsesAdapter(base, openaiCodec)}
+	return &openAIResponsesEngine{adapter: newResponsesAdapter(base, openaiCodec)}
 }
 
-// 已弃用：使用 NewOpenAIResponsesEngine 代替。
-func NewOpenAIResponsesWithTransport(transport Transport, defaultModel string) *OpenAIResponsesEngine {
-	return NewOpenAIResponsesEngine(transport, defaultModel)
-}
-
-func (e *OpenAIResponsesEngine) Create(ctx context.Context, req *ResponseRequest) (*ResponseObject, error) {
-	if e.wrapped != nil {
-		return e.wrapped.create(ctx, req)
-	}
+func (e *openAIResponsesEngine) Create(ctx context.Context, req *ResponseRequest) (*ResponseObject, error) {
 	return e.adapter.generate(ctx, req)
 }
 
-func (e *OpenAIResponsesEngine) Stream(ctx context.Context, req *ResponseRequest) (ResponseStream, error) {
-	if e.wrapped != nil {
-		return e.wrapped.stream(ctx, req)
-	}
+func (e *openAIResponsesEngine) Stream(ctx context.Context, req *ResponseRequest) (ResponseStream, error) {
 	return e.adapter.stream(ctx, req)
 }
 
-func (e *OpenAIResponsesEngine) Close() {
-	if e.wrapped != nil {
-		e.wrapped.close()
-	}
+func (e *openAIResponsesEngine) Close() error {
+	return nil
 }
 
-// Capabilities returns the protocol capabilities supported by OpenAI Responses API.
-func (e *OpenAIResponsesEngine) Capabilities() *ProtocolCapabilities {
+func (e *openAIResponsesEngine) Capabilities() *ProtocolCapabilities {
 	return cloneProtocolCapabilities(openAIResponsesCapabilitiesTemplate)
 }
 
@@ -213,59 +178,45 @@ type oaiStreamChoice struct {
 // -----------------------------------------------------------------------------
 
 type openAIResponseStream struct {
-	resp    *http.Response
-	framer  *sseFrameReader
-	codec   *OpenAICodec
-	current ResponseEvent
-	err     error
-	done    bool
+	core      sseIteratorCore
+	resp      *http.Response
+	codec     *openAICodec
+	current   ResponseEvent
+	closeOnce sync.Once
 }
 
-func newOpenAIResponseStream(resp *http.Response, codec *OpenAICodec) *openAIResponseStream {
-	return &openAIResponseStream{resp: resp, framer: newSSEFrameReader(resp.Body), codec: codec}
+func newOpenAIResponseStream(resp *http.Response, codec *openAICodec) *openAIResponseStream {
+	return &openAIResponseStream{
+		resp: resp,
+		core: sseIteratorCore{
+			framer: newSSEFrameReader(resp.Body),
+			wrapError: func(err error) error {
+				wrapped := WrapOperationalError("response stream read error", err)
+				var llmErr *LLMError
+				if errors.As(wrapped, &llmErr) && (llmErr.Code == ErrCodeTimeout || llmErr.Code == ErrCodeCancelled || llmErr.Code == ErrCodeNetwork) {
+					return wrapped
+				}
+				return NewLLMError(ErrCodeParse, err.Error(), nil)
+			},
+		},
+		codec: codec,
+	}
 }
 
 func (s *openAIResponseStream) Next() bool {
-	if s.done || s.err != nil {
-		return false
-	}
-
-	for {
-		result := consumeSSEFrame(s.framer)
-		if result.Done {
-			s.done = true
-			return false
-		}
-		if result.Err != nil {
-			wrapped := WrapOperationalError("response stream read error", result.Err)
-			var llmErr *LLMError
-			if errors.As(wrapped, &llmErr) && (llmErr.Code == ErrCodeTimeout || llmErr.Code == ErrCodeCancelled || llmErr.Code == ErrCodeNetwork) {
-				s.err = wrapped
-			} else {
-				s.err = NewLLMError(ErrCodeParse, result.Err.Error(), nil)
-			}
-			return false
-		}
-		if s.dispatch(result.Frame) {
-			return true
-		}
-		if s.done || s.err != nil {
-			return false
-		}
-	}
+	return s.core.Next(s.dispatch)
 }
 
-func (s *openAIResponseStream) dispatch(frame sseFrame) bool {
+func (s *openAIResponseStream) dispatch(frame sseFrame) sseDispatchResult {
 	var decoded oaiResponseEvent
 	if err := json.Unmarshal(frame.Data, &decoded); err != nil {
-		s.err = NewLLMError(ErrCodeParse, "parse response stream event", err)
-		return false
+		return sseDispatchResult{Err: NewLLMError(ErrCodeParse, "parse response stream event", err)}
 	}
 	if decoded.Type == "" {
 		decoded.Type = frame.Event
 	}
 	s.current = s.codec.ConvertResponseEvent(decoded)
-	return true
+	return sseDispatchResult{Yield: true}
 }
 
 func (s *openAIResponseStream) Current() ResponseEvent {
@@ -273,14 +224,17 @@ func (s *openAIResponseStream) Current() ResponseEvent {
 }
 
 func (s *openAIResponseStream) Err() error {
-	return s.err
+	return s.core.Err()
 }
 
 func (s *openAIResponseStream) Close() error {
-	if s.resp != nil && s.resp.Body != nil {
-		return s.resp.Body.Close()
-	}
-	return nil
+	var err error
+	s.closeOnce.Do(func() {
+		if s.resp != nil && s.resp.Body != nil {
+			err = s.resp.Body.Close()
+		}
+	})
+	return err
 }
 
 type oaiResponseObject struct {
@@ -303,17 +257,9 @@ type oaiResponseEvent struct {
 
 // request
 
-// openaiCodec 是单个共享实例，因为 OpenAICodec 是 stateless。
-var openaiCodec = &OpenAICodec{}
+var openaiCodec = &openAICodec{}
 
-// OpenAICodec implements request encoding for OpenAI-compatible APIs.
-type OpenAICodec struct{}
-
-// NewOpenAICodec 返回共享的 OpenAI codec 实例。
-// 已弃用：直接使用 openaiCodec 全局变量。
-func NewOpenAICodec() *OpenAICodec {
-	return openaiCodec
-}
+type openAICodec struct{}
 
 func buildResponsesReasoning(reasoning *ResponseReasoning) map[string]any {
 	if reasoning == nil {
@@ -328,7 +274,7 @@ func buildResponsesReasoning(reasoning *ResponseReasoning) map[string]any {
 	return result
 }
 
-func (c *OpenAICodec) BuildChatRequestBody(req *Request, model string, stream bool) ([]byte, error) {
+func (c *openAICodec) BuildChatRequestBody(req *Request, model string, stream bool) ([]byte, error) {
 	reqMap := map[string]any{
 		"model":    model,
 		"messages": convertMessages(req.Messages),
@@ -356,7 +302,7 @@ func (c *OpenAICodec) BuildChatRequestBody(req *Request, model string, stream bo
 	return json.Marshal(reqMap)
 }
 
-func (c *OpenAICodec) BuildResponsesRequestBody(req *ResponseRequest, model string, stream bool) ([]byte, error) {
+func (c *openAICodec) BuildResponsesRequestBody(req *ResponseRequest, model string, stream bool) ([]byte, error) {
 	reqMap := map[string]any{
 		"model":  model,
 		"input":  convertResponseInputItems(req.Input),
@@ -372,7 +318,7 @@ func (c *OpenAICodec) BuildResponsesRequestBody(req *ResponseRequest, model stri
 
 // response
 
-func (c *OpenAICodec) ParseChatSSEChunk(event string, data []byte) (*Response, bool, error) {
+func (c *openAICodec) ParseChatSSEChunk(event string, data []byte) (*Response, bool, error) {
 	var chunk oaiStreamChunk
 	if err := json.Unmarshal(data, &chunk); err != nil {
 		return nil, false, err
@@ -427,7 +373,7 @@ func (c *OpenAICodec) ParseChatSSEChunk(event string, data []byte) (*Response, b
 	return response, isDone, nil
 }
 
-func (c *OpenAICodec) ConvertChatResponse(oaiResp *oaiResponse) *Response {
+func (c *openAICodec) ConvertChatResponse(oaiResp *oaiResponse) *Response {
 	if len(oaiResp.Choices) == 0 {
 		return &Response{}
 	}
@@ -464,18 +410,18 @@ func (c *OpenAICodec) ConvertChatResponse(oaiResp *oaiResponse) *Response {
 	}
 }
 
-func (c *OpenAICodec) ConvertResponseObject(response *oaiResponseObject) *ResponseObject {
+func (c *openAICodec) ConvertResponseObject(response *oaiResponseObject) *ResponseObject {
 	if response == nil {
 		return nil
 	}
 	output := make([]ResponseOutput, len(response.Output))
 	for i, o := range response.Output {
-		o.Type = defaultString(o.Type, "message")
+		o.Type = DefaultString(o.Type, "message")
 		output[i] = o
 	}
 	return normalizeCompletedResponseObject(&ResponseObject{
 		ID:          response.ID,
-		Object:      defaultString(response.Object, "response"),
+		Object:      DefaultString(response.Object, "response"),
 		Status:      response.Status,
 		Model:       response.Model,
 		Output:      output,
@@ -485,10 +431,10 @@ func (c *OpenAICodec) ConvertResponseObject(response *oaiResponseObject) *Respon
 	})
 }
 
-func (c *OpenAICodec) ConvertResponseEvent(event oaiResponseEvent) ResponseEvent {
+func (c *openAICodec) ConvertResponseEvent(event oaiResponseEvent) ResponseEvent {
 	result := ResponseEvent{Type: event.Type, Delta: event.Delta}
 	if event.Item != nil {
-		event.Item.Type = defaultString(event.Item.Type, "message")
+		event.Item.Type = DefaultString(event.Item.Type, "message")
 		result.Item = event.Item
 	}
 	if event.Response != nil {
@@ -497,7 +443,71 @@ func (c *OpenAICodec) ConvertResponseEvent(event oaiResponseEvent) ResponseEvent
 	return result
 }
 
-func isReasoningEffortUnsupported(body []byte) bool {
-	msg := strings.ToLower(string(body))
-	return strings.Contains(msg, "unrecognized request argument") && strings.Contains(msg, "reasoning_effort")
+func convertMessages(messages []Message) []oaiMessage {
+	result := make([]oaiMessage, len(messages))
+	for i, msg := range messages {
+		oaiMsg := oaiMessage{Role: string(msg.Role), Name: msg.Name, ToolCallID: msg.ToolCallID}
+
+		switch len(msg.Content) {
+		case 0:
+			oaiMsg.Content = nil
+		case 1:
+			switch p := msg.Content[0].(type) {
+			case TextPart:
+				oaiMsg.Content = string(p)
+			case ImagePart:
+				if img := buildImageContent(p); img != nil {
+					oaiMsg.Content = []map[string]any{img}
+				}
+			}
+		default:
+			var parts []map[string]any
+			for _, part := range msg.Content {
+				switch p := part.(type) {
+				case TextPart:
+					parts = append(parts, map[string]any{"type": "text", "text": string(p)})
+				case ImagePart:
+					if img := buildImageContent(p); img != nil {
+						parts = append(parts, img)
+					}
+				}
+			}
+			if len(parts) > 0 {
+				oaiMsg.Content = parts
+			}
+		}
+
+		if len(msg.ToolCalls) > 0 {
+			oaiMsg.ToolCalls = make([]oaiToolCall, len(msg.ToolCalls))
+			for k, tc := range msg.ToolCalls {
+				oaiMsg.ToolCalls[k] = oaiToolCall{
+					Index: k,
+					ID:    tc.ID,
+					Type:  tc.Type,
+					Function: struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}{Name: tc.Name, Arguments: tc.Arguments},
+				}
+			}
+		}
+
+		result[i] = oaiMsg
+	}
+	return result
+}
+
+func convertTools(tools []Tool) []oaiTool {
+	result := make([]oaiTool, len(tools))
+	for i, t := range tools {
+		result[i] = oaiTool{
+			Type: "function",
+			Function: oaiFunction{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.Parameters,
+			},
+		}
+	}
+	return result
 }
