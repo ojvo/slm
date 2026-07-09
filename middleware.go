@@ -272,7 +272,7 @@ func rateLimitMiddlewares[Req any, Resp any, StreamResp any](limit float64, burs
 		return func(ctx context.Context, req Req) (Resp, error) {
 			var zero Resp
 			if err := limiter.Wait(ctx); err != nil {
-				return zero, fmt.Errorf("rate limit exceeded: %w", err)
+				return zero, WrapOperationalError("rate limiter wait failed", err)
 			}
 			return next(ctx, req)
 		}
@@ -281,7 +281,7 @@ func rateLimitMiddlewares[Req any, Resp any, StreamResp any](limit float64, burs
 		return func(ctx context.Context, req Req) (StreamResp, error) {
 			var zero StreamResp
 			if err := limiter.Wait(ctx); err != nil {
-				return zero, fmt.Errorf("rate limit exceeded: %w", err)
+				return zero, WrapOperationalError("rate limiter wait failed", err)
 			}
 			return next(ctx, req)
 		}
@@ -461,9 +461,9 @@ func wrapTimeoutStream(inner any, cancel context.CancelFunc, ctx context.Context
 	}
 	switch s := inner.(type) {
 	case StreamIterator:
-		return &timeoutStreamIterator{streamIteratorWrapper: streamIteratorWrapper{inner: s}, base: base}
+		return &timeoutStreamIterator{streamIteratorWrapper: streamIteratorWrapper{inner: s}, base: &base}
 	case ResponseStream:
-		return &timeoutResponseStream{responseStreamWrapper: responseStreamWrapper{inner: s}, base: base}
+		return &timeoutResponseStream{responseStreamWrapper: responseStreamWrapper{inner: s}, base: &base}
 	}
 	return nil
 }
@@ -530,7 +530,7 @@ func (t *timeoutBaseStream) Close() error {
 
 type timeoutStreamIterator struct {
 	streamIteratorWrapper
-	base timeoutBaseStream
+	base *timeoutBaseStream
 }
 
 func (t *timeoutStreamIterator) Next() bool   { return t.base.Next() }
@@ -544,7 +544,7 @@ func (t *timeoutStreamIterator) Interrupt(err error) {
 
 type timeoutResponseStream struct {
 	responseStreamWrapper
-	base timeoutBaseStream
+	base *timeoutBaseStream
 }
 
 func (t *timeoutResponseStream) Next() bool   { return t.base.Next() }

@@ -190,7 +190,7 @@ func (c *observedStreamCore) onClose(inner BaseStream) error {
 
 type observedChatStream struct {
 	streamIteratorWrapper
-	core observedStreamCore
+	core *observedStreamCore
 }
 
 func (o *observedChatStream) Next() bool {
@@ -207,7 +207,7 @@ func (o *observedChatStream) Close() error {
 
 type observedResponseStreamWrapper struct {
 	responseStreamWrapper
-	core observedStreamCore
+	core *observedStreamCore
 }
 
 func (o *observedResponseStreamWrapper) Next() bool {
@@ -236,7 +236,7 @@ func wrapObservedStream[Req any, Resp any, StreamResp any](
 		core.onFinish = func(e *LifecycleEvent) {
 			e.Response = s.Response()
 		}
-		w := &observedChatStream{streamIteratorWrapper: streamIteratorWrapper{inner: s}, core: core}
+		w := &observedChatStream{streamIteratorWrapper: streamIteratorWrapper{inner: s}, core: &core}
 		if result, ok := any(w).(StreamResp); ok {
 			return result
 		}
@@ -246,7 +246,7 @@ func wrapObservedStream[Req any, Resp any, StreamResp any](
 				e.ResponseObject = current.Response
 			}
 		}
-		w := &observedResponseStreamWrapper{responseStreamWrapper: responseStreamWrapper{inner: s}, core: core}
+		w := &observedResponseStreamWrapper{responseStreamWrapper: responseStreamWrapper{inner: s}, core: &core}
 		if result, ok := any(w).(StreamResp); ok {
 			return result
 		}

@@ -235,7 +235,7 @@ func mergeToolCallDelta(m map[int]*toolCallAccum, idx int, tc APIToolCall) {
 }
 
 func resolveToolCallIndex(ordinal int, tc APIToolCall) int {
-	if tc.Index > 0 {
+	if tc.Index >= 0 {
 		return tc.Index
 	}
 	return ordinal

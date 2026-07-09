@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 )
 
 type requestValidator[Req any] func(Req) error
 type requestBodyBuilder[Req any] func(Req, string, bool) ([]byte, error)
 type responseDecoder[Resp any] func(*http.Response) (Resp, error)
 type streamFactory[StreamResp any] func(*http.Response) (StreamResp, error)
-type postValidator[Req any] func(*http.Response, Req, string, bool) (*http.Response, error)
+type postValidator[Req any] func(context.Context, *http.Response, Req, string, bool) (*http.Response, error)
 
 type genericAdapter[Req any, Resp any, StreamResp any] struct {
 	base         protocolBase
@@ -51,6 +52,12 @@ func (a *genericAdapter[Req, Resp, StreamResp]) stream(ctx context.Context, req 
 		return zero, llmErrorFromResponse(resp)
 	}
 
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.Contains(strings.ToLower(contentType), "text/event-stream") {
+		defer resp.Body.Close()
+		return zero, llmErrorFromResponse(resp)
+	}
+
 	return a.createStream(resp)
 }
 
@@ -77,7 +84,7 @@ func (a *genericAdapter[Req, Resp, StreamResp]) doRequest(ctx context.Context, r
 	}
 
 	if a.postValidate != nil {
-		return a.postValidate(resp, req, model, stream)
+		return a.postValidate(ctx, resp, req, model, stream)
 	}
 
 	return resp, nil
@@ -129,8 +136,8 @@ func newChatAdapter(base protocolBase, codec *openAICodec) *genericAdapter[*Requ
 		createStream: func(resp *http.Response) (StreamIterator, error) {
 			return NewSSEReader(resp.Body, codec.ParseChatSSEChunk), nil
 		},
-		postValidate: func(resp *http.Response, req *Request, model string, stream bool) (*http.Response, error) {
-			return chatPostValidate(resp, req, model, stream, codec, &base)
+		postValidate: func(ctx context.Context, resp *http.Response, req *Request, model string, stream bool) (*http.Response, error) {
+			return chatPostValidate(ctx, resp, req, model, stream, codec, &base)
 		},
 	}
 }
@@ -156,7 +163,7 @@ func newResponsesAdapter(base protocolBase, codec *openAICodec) *genericAdapter[
 	}
 }
 
-func chatPostValidate(resp *http.Response, req *Request, model string, stream bool, codec *openAICodec, base *protocolBase) (*http.Response, error) {
+func chatPostValidate(ctx context.Context, resp *http.Response, req *Request, model string, stream bool, codec *openAICodec, base *protocolBase) (*http.Response, error) {
 	if resp.StatusCode != http.StatusBadRequest || req.Reasoning == nil {
 		return resp, nil
 	}
@@ -175,9 +182,17 @@ func chatPostValidate(resp *http.Response, req *Request, model string, stream bo
 
 	fallbackBody, err := codec.BuildChatRequestBody(fallbackReq, model, stream)
 	if err != nil {
-		return nil, fmt.Errorf("marshal fallback request: %w", err)
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		resp.ContentLength = int64(len(bodyBytes))
+		return resp, nil
 	}
 
 	headers := streamRequestHeaders(stream)
-	return base.doPost(context.Background(), "/chat/completions", headers, fallbackBody)
+	fallbackResp, err := base.doPost(ctx, "/chat/completions", headers, fallbackBody)
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		resp.ContentLength = int64(len(bodyBytes))
+		return resp, nil
+	}
+	return fallbackResp, nil
 }

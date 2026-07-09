@@ -79,11 +79,15 @@ func (c Config) BuildEngineWithTransport() (Engine, error) {
 	if err := c.validateBuildConfig(); err != nil {
 		return nil, err
 	}
+	protocol := c.Provider.Protocol
+	if protocol == "" {
+		protocol = ProtocolOpenAI
+	}
 	var engine Engine
 	if c.Transport != nil {
-		engine = NewEngine(ProtocolOpenAI, c.Transport, c.Provider.DefaultModel)
+		engine = NewEngine(protocol, c.Transport, c.Provider.DefaultModel)
 	} else {
-		engine = NewEngineWithEndpoint(ProtocolOpenAI, c.Provider.Endpoint, c.Provider.APIKey, c.Provider.DefaultModel)
+		engine = NewEngineWithEndpoint(protocol, c.Provider.Endpoint, c.Provider.APIKey, c.Provider.DefaultModel)
 	}
 	return c.applyMiddleware(engine), nil
 }
@@ -150,4 +154,5 @@ type ProviderConfig struct {
 	Endpoint     string
 	DefaultModel string
 	APIKey       string
+	Protocol     ProtocolType
 }

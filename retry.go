@@ -35,7 +35,11 @@ func ExponentialBackoff(attempt int) time.Duration {
 
 func ExponentialBackoffWithJitter(attempt int) time.Duration {
 	base := ExponentialBackoff(attempt)
-	jitter := time.Duration(rand.Int63n(int64(base) / 2))
+	half := int64(base) / 2
+	if half <= 0 {
+		return base
+	}
+	jitter := time.Duration(rand.Int63n(half))
 	result := base + jitter
 	if result > maxBackoff {
 		return maxBackoff

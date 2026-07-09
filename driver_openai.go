@@ -286,6 +286,7 @@ func (c *openAICodec) BuildChatRequestBody(req *Request, model string, stream bo
 	putFloat64PtrField(reqMap, "presence_penalty", req.PresencePenalty)
 	putFloat64PtrField(reqMap, "frequency_penalty", req.FrequencyPenalty)
 	putPositiveIntField(reqMap, "max_tokens", req.MaxTokens)
+	putPositiveIntField(reqMap, "max_completion_tokens", req.MaxTokens)
 	putSliceField(reqMap, "stop", req.Stop)
 	if stream {
 		reqMap["stream_options"] = map[string]any{"include_usage": true}

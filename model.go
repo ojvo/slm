@@ -84,8 +84,8 @@ func ModelsResponseToCatalogLoader(resp ModelsResponse) CapabilityCatalogLoader 
 	}
 }
 
-func FetchModelsCatalog(ctx context.Context, transport Transport, baseURL string) (ModelsResponse, error) {
-	resp, err := transport.Do(ctx, "GET", baseURL+"/models", nil, nil)
+func FetchModelsCatalog(ctx context.Context, transport Transport) (ModelsResponse, error) {
+	resp, err := transport.Do(ctx, "GET", "/models", nil, nil)
 	if err != nil {
 		return ModelsResponse{}, err
 	}

@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -27,15 +29,32 @@ type HTTPTransport struct {
 func NewHTTPTransport(baseURL, apiKey string) *HTTPTransport {
 	baseURL = strings.TrimRight(baseURL, "/")
 	return &HTTPTransport{
-		Client: &http.Client{
-			Timeout: 120 * time.Second,
-		},
+		Client:      newNoProxyHTTPClient(120 * time.Second),
 		BaseURL:     baseURL,
 		APIKey:      apiKey,
 		AuthHeader:  "Authorization",
 		AuthPrefix:  "Bearer ",
 		ExtraHeader: make(map[string]string),
 	}
+}
+
+func newNoProxyHTTPClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	client := &http.Client{Transport: transport}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	return client
 }
 
 // NewHTTPTransportWithClient 创建使用自定义 HTTP 客户端的传输层。
@@ -63,9 +82,12 @@ func (t *HTTPTransport) Do(ctx context.Context, method, path string, headers map
 	apiKey := t.APIKey
 	authHeader := t.AuthHeader
 	authPrefix := t.AuthPrefix
-	extraHeader := make(map[string]string, len(t.ExtraHeader))
-	for k, v := range t.ExtraHeader {
-		extraHeader[k] = v
+	var extraHeader map[string]string
+	if len(t.ExtraHeader) > 0 {
+		extraHeader = make(map[string]string, len(t.ExtraHeader))
+		for k, v := range t.ExtraHeader {
+			extraHeader[k] = v
+		}
 	}
 	t.mu.RUnlock()
 
