@@ -1762,3 +1762,69 @@ func TestExponentialBackoffWithJitter_NoPanic(t *testing.T) {
 		}
 	}
 }
+
+
+func TestResponseInputDisplayText_String(t *testing.T) {
+	item := ResponseInputItem{Role: "user", Content: "hello"}
+	if got := ResponseInputDisplayText(item); got != "hello" {
+		t.Fatalf("ResponseInputDisplayText() = %q, want hello", got)
+	}
+}
+
+func TestResponseInputDisplayText_Parts(t *testing.T) {
+	item := ResponseInputItem{
+		Role: "user",
+		Content: []ResponseInputContentPart{
+			ResponseInputTextPart{Type: "input_text", Text: "hello "},
+			ResponseInputTextPart{Type: "input_text", Text: "world"},
+		},
+	}
+	if got := ResponseInputDisplayText(item); got != "hello world" {
+		t.Fatalf("ResponseInputDisplayText(parts) = %q, want hello world", got)
+	}
+}
+
+func TestResponseWireTools_MapsToAnySlice(t *testing.T) {
+	if got := ResponseWireTools(nil); got != nil {
+		t.Fatalf("ResponseWireTools(nil) = %#v, want nil", got)
+	}
+	tools := []ResponseTool{{Type: "function", Name: "lookup"}}
+	mapped := ResponseWireTools(tools)
+	if len(mapped) != 1 {
+		t.Fatalf("ResponseWireTools() len = %d, want 1", len(mapped))
+	}
+	tool, ok := mapped[0].(ResponseTool)
+	if !ok || tool.Name != "lookup" {
+		t.Fatalf("ResponseWireTools()[0] = %#v, want ResponseTool{Name:lookup}", mapped[0])
+	}
+}
+
+func TestSummarizeNormalizedChatRequest(t *testing.T) {
+	summary := SummarizeNormalizedChatRequest(&Request{
+		Model: "gpt-4.1",
+		Messages: []Message{{
+			Role:      RoleUser,
+			Content:   []ContentPart{TextPart("look"), ImagePart{URL: "https://example.com/image.png", Detail: "high"}},
+			ToolCalls: []APIToolCall{{ID: "call_1", Type: "function", Name: "lookup", Arguments: `{}`}},
+		}},
+		Tools:    []Tool{{Name: "lookup"}},
+		JSONMode: true,
+	})
+	if !strings.Contains(summary, `vision_parts=1`) || !strings.Contains(summary, `tool_calls=1`) || !strings.Contains(summary, `json_mode=true`) {
+		t.Fatalf("expected summary to include normalized fields, got %s", summary)
+	}
+}
+
+func TestSummarizeNormalizedResponsesRequest(t *testing.T) {
+	summary := SummarizeNormalizedResponsesRequest(&ResponseRequest{
+		Model:           "gpt-5-mini",
+		Input:           []ResponseInputItem{{Role: "user", Content: "hi"}},
+		Tools:           []ResponseTool{{Type: "function", Name: "lookup"}},
+		Reasoning:       &ResponseReasoning{Effort: "medium"},
+		MaxOutputTokens: 256,
+		Store:           true,
+	})
+	if !strings.Contains(summary, `input_items=1`) || !strings.Contains(summary, `tools=1`) || !strings.Contains(summary, `max_output_tokens=256`) {
+		t.Fatalf("expected summary to include response fields, got %s", summary)
+	}
+}

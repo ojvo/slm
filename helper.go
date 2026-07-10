@@ -139,6 +139,44 @@ func ResolveRequestedModel(requestedModel, defaultModel string) string {
 	return strings.TrimSpace(defaultModel)
 }
 
+// ResponseInputDisplayText returns a human-readable text projection of
+// ResponseInputItem content for diagnostics and logging.
+func ResponseInputDisplayText(item ResponseInputItem) string {
+	switch v := item.Content.(type) {
+	case string:
+		return v
+	case []ResponseInputContentPart:
+		var texts []string
+		for _, part := range v {
+			if tp, ok := part.(ResponseInputTextPart); ok {
+				texts = append(texts, tp.Text)
+			}
+		}
+		return strings.Join(texts, "")
+	default:
+		data, _ := json.Marshal(v)
+		return string(data)
+	}
+}
+
+// ResponseInputWireContent returns the underlying content value as-is so
+// compatibility layers can project the canonical slm model into wire JSON.
+func ResponseInputWireContent(item ResponseInputItem) any {
+	return item.Content
+}
+
+// ResponseWireTools converts typed response tools to []any for wire serializers.
+func ResponseWireTools(tools []ResponseTool) []any {
+	if len(tools) == 0 {
+		return nil
+	}
+	result := make([]any, len(tools))
+	for i, tool := range tools {
+		result[i] = tool
+	}
+	return result
+}
+
 // llmErrorFromResponse normalizes non-success HTTP responses to LLMError.
 func llmErrorFromResponse(resp *http.Response) error {
 	if resp == nil {

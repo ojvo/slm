@@ -452,8 +452,40 @@ slm/
 ├── sse.go                  # SSE 帧解析与流迭代器
 ├── transport_http.go       # HTTP Transport 实现
 ├── types.go                # 核心类型与接口定义
-└── cmd/slm/main.go         # 示例程序
+├── cmd/slm/main.go         # 示例程序
+│
+└── docs/                   # 设计文档
+    ├── architecture.md     # 架构设计
+    ├── design-philosophy.md # 设计哲学
+    ├── orchestration.md    # 编排包说明
+    └── ...
 ```
+
+> Agent 编排能力已抽离为独立模块 `ojv/cofo`。SLM 仅保留协议/传输/中间件核心能力。
+
+## COFO 编排模块（外置）
+
+推荐配合 `ojv/cofo` 使用 Agent 编排能力：
+
+- `ojv/cofo/primitives`: Agent Runtime Primitives
+- `ojv/cofo/algorithms`: Agent Orchestration Algorithms
+- `ojv/cofo/guardrails`: Reliability/Guardrails Layer
+
+最小组合示例：
+
+```go
+import (
+    "ojv/cofo/algorithms"
+    "ojv/slm"
+)
+
+func compactHistory(msgs []slm.Message) []slm.Message {
+    result := algorithms.Compact(msgs, 32000)
+    return result.Messages
+}
+```
+
+从旧路径迁移请参考 [docs/migration-agent-to-cofo.md](docs/migration-agent-to-cofo.md)。
 
 ## 设计原则
 
@@ -467,3 +499,4 @@ slm/
 ## 许可证
 
 MIT License
+

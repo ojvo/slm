@@ -1,6 +1,9 @@
 package slm
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // ErrorDiagnosticFields returns reusable key/value pairs describing an error.
 func ErrorDiagnosticFields(err error) []any {
@@ -87,4 +90,31 @@ func eventDiagnosticFields(event LifecycleEvent) []any {
 		return ResponseRequestDiagnosticFields(event.ResponseRequest)
 	}
 	return RequestDiagnosticFields(event.Request)
+}
+
+// SummarizeNormalizedChatRequest returns a compact diagnostics summary for
+// canonical normalized chat requests.
+func SummarizeNormalizedChatRequest(request *Request) string {
+	if request == nil {
+		return "chat normalized=nil"
+	}
+	reasoning := ""
+	if request.Reasoning != nil {
+		reasoning = request.Reasoning.Effort
+	}
+	stats := ScanMessages(request.Messages)
+	return fmt.Sprintf("chat model=%q stream=%t messages=%d multipart_messages=%d vision_parts=%d tool_calls=%d tools=%d json_mode=%t reasoning=%q max_tokens=%d stop_count=%d capabilities_keys=%d", request.Model, request.Stream, len(request.Messages), stats.MultipartMessages, stats.VisionParts, stats.ToolCalls, len(request.Tools), request.JSONMode, reasoning, request.MaxTokens, len(request.Stop), len(request.Capabilities))
+}
+
+// SummarizeNormalizedResponsesRequest returns a compact diagnostics summary for
+// canonical normalized responses requests.
+func SummarizeNormalizedResponsesRequest(request *ResponseRequest) string {
+	if request == nil {
+		return "responses normalized=nil"
+	}
+	reasoning := ""
+	if request.Reasoning != nil {
+		reasoning = request.Reasoning.Effort
+	}
+	return fmt.Sprintf("responses model=%q stream=%t input_items=%d tools=%d reasoning=%q max_output_tokens=%d store=%t capabilities_keys=%d", request.Model, request.Stream, len(request.Input), len(request.Tools), reasoning, request.MaxOutputTokens, request.Store, len(request.Capabilities))
 }

@@ -66,6 +66,18 @@ type Message struct {
 	ToolCallID string
 }
 
+// Text returns the concatenated text content of the message.
+// For messages with multiple content parts, only TextPart values are concatenated.
+func (m Message) Text() string {
+	var b strings.Builder
+	for _, p := range m.Content {
+		if t, ok := p.(TextPart); ok {
+			b.WriteString(string(t))
+		}
+	}
+	return b.String()
+}
+
 // -----------------------------------------------------------------------------
 // Chat Request / Response Model
 // -----------------------------------------------------------------------------
