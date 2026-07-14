@@ -1828,3 +1828,419 @@ func TestSummarizeNormalizedResponsesRequest(t *testing.T) {
 		t.Fatalf("expected summary to include response fields, got %s", summary)
 	}
 }
+
+
+func TestDetectContextOverflow_OpenAIStyle(t *testing.T) {
+	body := `{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens."}}`
+	if !DetectContextOverflow(body) {
+		t.Error("expected DetectContextOverflow to return true for OpenAI context_length_exceeded")
+	}
+}
+
+func TestDetectContextOverflow_AnthropicStyle(t *testing.T) {
+	body := `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 137500 tokens > 200000 maximum"}}`
+	if !DetectContextOverflow(body) {
+		t.Error("expected DetectContextOverflow to return true for Anthropic 'prompt is too long'")
+	}
+}
+
+func TestDetectContextOverflow_EmptyBody(t *testing.T) {
+	if DetectContextOverflow("") {
+		t.Error("expected DetectContextOverflow to return false for empty body")
+	}
+}
+
+func TestDetectContextOverflow_UnrelatedError(t *testing.T) {
+	body := `{"error":{"message":"rate limit exceeded"}}`
+	if DetectContextOverflow(body) {
+		t.Error("expected DetectContextOverflow to return false for unrelated error")
+	}
+}
+
+func TestDetectContextOverflow_VariousPhrasings(t *testing.T) {
+	cases := []string{
+		"input is too long",
+		"request too large",
+		"too many tokens",
+		"maximum context length exceeded",
+		"exceeds the context window",
+		"model_context_window_exceeded",
+	}
+	for _, c := range cases {
+		if !DetectContextOverflow(c) {
+			t.Errorf("expected DetectContextOverflow true for %q", c)
+		}
+	}
+}
+
+func TestParseOverflowTokens_AnthropicStyle(t *testing.T) {
+	body := `{"error":{"message":"prompt is too long: 137500 tokens > 135000 maximum"}}`
+	gap := ParseOverflowTokens(body)
+	if gap.Actual != 137500 {
+		t.Errorf("expected Actual 137500, got %d", gap.Actual)
+	}
+	if gap.Limit != 135000 {
+		t.Errorf("expected Limit 135000, got %d", gap.Limit)
+	}
+}
+
+func TestParseOverflowTokens_OpenAIStyle(t *testing.T) {
+	body := `This model's maximum context length is 128000 tokens. However, your messages resulted in 145230 tokens.`
+	gap := ParseOverflowTokens(body)
+	if gap.Actual != 145230 {
+		t.Errorf("expected Actual 145230, got %d", gap.Actual)
+	}
+	if gap.Limit != 128000 {
+		t.Errorf("expected Limit 128000, got %d", gap.Limit)
+	}
+}
+
+func TestParseOverflowTokens_NoNumbers(t *testing.T) {
+	body := `context length exceeded`
+	gap := ParseOverflowTokens(body)
+	if gap.Actual != 0 || gap.Limit != 0 {
+		t.Errorf("expected zero gap, got Actual=%d Limit=%d", gap.Actual, gap.Limit)
+	}
+}
+
+func TestParseOverflowTokens_WithCommas(t *testing.T) {
+	body := `prompt is too long: 1,375,000 tokens > 1,350,000 maximum`
+	gap := ParseOverflowTokens(body)
+	if gap.Actual != 1375000 {
+		t.Errorf("expected Actual 1375000, got %d", gap.Actual)
+	}
+	if gap.Limit != 1350000 {
+		t.Errorf("expected Limit 1350000, got %d", gap.Limit)
+	}
+}
+
+
+// --- ThinkingPart content part ---
+
+func TestThinkingPartIsContentPart(t *testing.T) {
+	var p ContentPart = ThinkingPart{Content: "reasoning", Signature: "sig"}
+	if p == nil {
+		t.Fatal("ThinkingPart should satisfy ContentPart interface")
+	}
+}
+
+// --- OpenAI convertMessages: ThinkingPart -> reasoning_content ---
+
+func TestConvertMessages_ThinkingPartSetsReasoningContent(t *testing.T) {
+	messages := []Message{
+		{
+			Role: RoleAssistant,
+			Content: []ContentPart{
+				ThinkingPart{Content: "Let me think about this", Signature: "sig123"},
+				TextPart("The answer is 42"),
+			},
+		},
+	}
+
+	result := convertMessages(messages)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+
+	if result[0].ReasoningContent != "Let me think about this" {
+		t.Errorf("expected ReasoningContent 'Let me think about this', got %q", result[0].ReasoningContent)
+	}
+
+	// Text content should still be present
+	if s, ok := result[0].Content.(string); !ok || s != "The answer is 42" {
+		t.Errorf("expected Content to be 'The answer is 42', got %v", result[0].Content)
+	}
+}
+
+func TestConvertMessages_ThinkingPartOnlyNoText(t *testing.T) {
+	messages := []Message{
+		{
+			Role: RoleAssistant,
+			Content: []ContentPart{
+				ThinkingPart{Content: "just thinking", Signature: "sig"},
+			},
+		},
+	}
+
+	result := convertMessages(messages)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+
+	if result[0].ReasoningContent != "just thinking" {
+		t.Errorf("expected ReasoningContent 'just thinking', got %q", result[0].ReasoningContent)
+	}
+
+	// Content should be nil since ThinkingPart is extracted and no text remains
+	if result[0].Content != nil {
+		t.Errorf("expected nil Content, got %v", result[0].Content)
+	}
+}
+
+func TestConvertMessages_NoThinkingPart(t *testing.T) {
+	messages := []Message{
+		{
+			Role:    RoleUser,
+			Content: []ContentPart{TextPart("hello")},
+		},
+	}
+
+	result := convertMessages(messages)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+
+	if result[0].ReasoningContent != "" {
+		t.Errorf("expected empty ReasoningContent, got %q", result[0].ReasoningContent)
+	}
+}
+
+// --- Claude convertMessagesToClaude: ThinkingPart -> thinking block ---
+
+func TestConvertMessagesToClaude_ThinkingPartEmitsThinkingBlock(t *testing.T) {
+	messages := []Message{
+		{
+			Role: RoleAssistant,
+			Content: []ContentPart{
+				ThinkingPart{Content: "I should consider all options", Signature: "signature_abc"},
+				TextPart("Here is my answer"),
+			},
+		},
+	}
+
+	result := convertMessagesToClaude(messages)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+
+	if len(result[0].Content) != 2 {
+		t.Fatalf("expected 2 content blocks, got %d", len(result[0].Content))
+	}
+
+	// Thinking block should be first
+	thinking := result[0].Content[0]
+	if thinking.Type != "thinking" {
+		t.Errorf("expected first block type 'thinking', got %q", thinking.Type)
+	}
+	if thinking.Thinking != "I should consider all options" {
+		t.Errorf("expected thinking content, got %q", thinking.Thinking)
+	}
+	if thinking.Signature != "signature_abc" {
+		t.Errorf("expected signature 'signature_abc', got %q", thinking.Signature)
+	}
+
+	// Text block should be second
+	text := result[0].Content[1]
+	if text.Type != "text" {
+		t.Errorf("expected second block type 'text', got %q", text.Type)
+	}
+	if text.Text != "Here is my answer" {
+		t.Errorf("expected text 'Here is my answer', got %q", text.Text)
+	}
+}
+
+func TestConvertMessagesToClaude_ThinkingPartWithoutSignatureSkipped(t *testing.T) {
+	messages := []Message{
+		{
+			Role: RoleAssistant,
+			Content: []ContentPart{
+				ThinkingPart{Content: "thinking without sig", Signature: ""},
+				TextPart("answer"),
+			},
+		},
+	}
+
+	result := convertMessagesToClaude(messages)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+
+	// Only the text block should be present — thinking block without signature
+	// would cause an Anthropic API error
+	if len(result[0].Content) != 1 {
+		t.Fatalf("expected 1 content block (thinking skipped), got %d", len(result[0].Content))
+	}
+	if result[0].Content[0].Type != "text" {
+		t.Errorf("expected type 'text', got %q", result[0].Content[0].Type)
+	}
+}
+
+func TestConvertMessagesToClaude_ThinkingPartBeforeToolCalls(t *testing.T) {
+	messages := []Message{
+		{
+			Role: RoleAssistant,
+			Content: []ContentPart{
+				ThinkingPart{Content: "I need to use a tool", Signature: "sig"},
+				TextPart("Let me search for that"),
+			},
+			ToolCalls: []APIToolCall{
+				{ID: "call_1", Type: "function", Name: "search", Arguments: `{"q":"test"}`},
+			},
+		},
+	}
+
+	result := convertMessagesToClaude(messages)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(result))
+	}
+
+	// Expected order: thinking, text, tool_use
+	if len(result[0].Content) != 3 {
+		t.Fatalf("expected 3 content blocks, got %d", len(result[0].Content))
+	}
+
+	if result[0].Content[0].Type != "thinking" {
+		t.Errorf("expected first block 'thinking', got %q", result[0].Content[0].Type)
+	}
+	if result[0].Content[1].Type != "text" {
+		t.Errorf("expected second block 'text', got %q", result[0].Content[1].Type)
+	}
+	if result[0].Content[2].Type != "tool_use" {
+		t.Errorf("expected third block 'tool_use', got %q", result[0].Content[2].Type)
+	}
+}
+
+// --- Claude ConvertChatResponse: thinking block -> Response ---
+
+func TestClaudeConvertChatResponse_CapturesThinkingAndSignature(t *testing.T) {
+	codec := claudeCodecInst
+	claudeResp := &claudeResponse{
+		Content: []claudeContent{
+			{Type: "thinking", Thinking: "Deep reasoning here", Signature: "sig_xyz"},
+			{Type: "text", Text: "The result is 42"},
+		},
+		StopReason: "end_turn",
+		Usage:      &Usage{PromptTokens: 10, CompletionTokens: 20, TotalTokens: 30},
+	}
+
+	resp := codec.ConvertChatResponse(claudeResp)
+
+	if resp.ReasoningContent != "Deep reasoning here" {
+		t.Errorf("expected ReasoningContent 'Deep reasoning here', got %q", resp.ReasoningContent)
+	}
+	if resp.ThinkingSignature != "sig_xyz" {
+		t.Errorf("expected ThinkingSignature 'sig_xyz', got %q", resp.ThinkingSignature)
+	}
+	if resp.Content != "The result is 42" {
+		t.Errorf("expected Content 'The result is 42', got %q", resp.Content)
+	}
+}
+
+func TestClaudeConvertChatResponse_NoThinkingBlock(t *testing.T) {
+	codec := claudeCodecInst
+	claudeResp := &claudeResponse{
+		Content: []claudeContent{
+			{Type: "text", Text: "No thinking here"},
+		},
+		StopReason: "end_turn",
+	}
+
+	resp := codec.ConvertChatResponse(claudeResp)
+
+	if resp.ReasoningContent != "" {
+		t.Errorf("expected empty ReasoningContent, got %q", resp.ReasoningContent)
+	}
+	if resp.ThinkingSignature != "" {
+		t.Errorf("expected empty ThinkingSignature, got %q", resp.ThinkingSignature)
+	}
+	if resp.Content != "No thinking here" {
+		t.Errorf("expected Content 'No thinking here', got %q", resp.Content)
+	}
+}
+
+func TestClaudeConvertChatResponse_MultipleThinkingBlocks(t *testing.T) {
+	codec := claudeCodecInst
+	claudeResp := &claudeResponse{
+		Content: []claudeContent{
+			{Type: "thinking", Thinking: "First thought", Signature: "sig1"},
+			{Type: "thinking", Thinking: "Second thought", Signature: "sig2"},
+			{Type: "text", Text: "Final answer"},
+		},
+		StopReason: "end_turn",
+	}
+
+	resp := codec.ConvertChatResponse(claudeResp)
+
+	// Multiple thinking blocks should concatenate reasoning content
+	expected := "First thoughtSecond thought"
+	if resp.ReasoningContent != expected {
+		t.Errorf("expected ReasoningContent %q, got %q", expected, resp.ReasoningContent)
+	}
+	// Last signature wins
+	if resp.ThinkingSignature != "sig2" {
+		t.Errorf("expected ThinkingSignature 'sig2', got %q", resp.ThinkingSignature)
+	}
+}
+
+// --- Usage fields ---
+
+func TestUsageCacheMissTokens_DeepSeekFormat(t *testing.T) {
+	u := Usage{
+		PromptTokens:     1000,
+		CacheHitTokens:   800,
+		CompletionTokens: 200,
+	}
+	if miss := u.CacheMissTokens(); miss != 200 {
+		t.Errorf("expected CacheMissTokens 200, got %d", miss)
+	}
+}
+
+func TestUsageCacheMissTokens_OpenAIFormat(t *testing.T) {
+	u := Usage{
+		PromptTokens:        1000,
+		PromptTokensDetails: &PromptTokensDetails{CachedTokens: 500},
+		CompletionTokens:    200,
+	}
+	if miss := u.CacheMissTokens(); miss != 500 {
+		t.Errorf("expected CacheMissTokens 500, got %d", miss)
+	}
+}
+
+func TestUsageCacheMissTokens_NoCache(t *testing.T) {
+	u := Usage{
+		PromptTokens:     1000,
+		CompletionTokens: 200,
+	}
+	if miss := u.CacheMissTokens(); miss != 1000 {
+		t.Errorf("expected CacheMissTokens 1000, got %d", miss)
+	}
+}
+
+func TestUsageTotalContextTokens(t *testing.T) {
+	u := Usage{
+		PromptTokens:     1000,
+		CompletionTokens: 500,
+		CacheHitTokens:   300,
+	}
+	if total := u.TotalContextTokens(); total != 1800 {
+		t.Errorf("expected TotalContextTokens 1800, got %d", total)
+	}
+}
+
+func TestUsageJSONRoundTrip(t *testing.T) {
+	u := Usage{
+		PromptTokens:        1000,
+		CompletionTokens:    500,
+		TotalTokens:         1500,
+		CacheHitTokens:      300,
+		PromptTokensDetails: &PromptTokensDetails{CachedTokens: 300},
+	}
+
+	data, err := json.Marshal(u)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	var decoded Usage
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	if decoded.CacheHitTokens != 300 {
+		t.Errorf("expected CacheHitTokens 300, got %d", decoded.CacheHitTokens)
+	}
+	if decoded.PromptTokensDetails == nil || decoded.PromptTokensDetails.CachedTokens != 300 {
+		t.Errorf("expected PromptTokensDetails.CachedTokens 300, got %v", decoded.PromptTokensDetails)
+	}
+}
+

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -166,4 +168,71 @@ func timeoutSource(err error) string {
 		return "network_timeout"
 	}
 	return ""
+}
+
+// DetectContextOverflow inspects a provider error body and reports
+// whether it represents a context-window-exceeded condition. The
+// matching is provider-agnostic: it covers both OpenAI's
+// `context_length_exceeded` code and Anthropic's "prompt is too long"
+// style messages, plus other common phrasings.
+func DetectContextOverflow(body string) bool {
+	if body == "" {
+		return false
+	}
+	msg := strings.ToLower(body)
+	return strings.Contains(msg, "context_length") ||
+		strings.Contains(msg, "context length exceeded") ||
+		strings.Contains(msg, "exceeds the context window") ||
+		strings.Contains(msg, "context window exceeds limit") ||
+		strings.Contains(msg, "maximum context length") ||
+		strings.Contains(msg, "model_context_window_exceeded") ||
+		strings.Contains(msg, "prompt is too long") ||
+		strings.Contains(msg, "input is too long") ||
+		strings.Contains(msg, "request too large") ||
+		strings.Contains(msg, "request buffer limit") ||
+		strings.Contains(msg, "too many tokens")
+}
+
+// OverflowTokenGap describes the token delta extracted from a context
+// overflow error. Zero values mean the gap could not be extracted.
+type OverflowTokenGap struct {
+	Actual int
+	Limit  int
+}
+
+// overflowTokenRe extracts (actual, limit) token counts from provider
+// error messages like "prompt is too long: 137500 tokens > 135000
+// maximum" or "This model's maximum context length is 128000 tokens.
+// However, your messages resulted in 145230 tokens."
+var overflowTokenRe = regexp.MustCompile(
+	`(\d[\d,]*)\s*tokens?\s*[>\.]\s*(\d[\d,]*)` +
+		`|maximum[^0-9]*(\d[\d,]*)[^0-9]*resulted[^0-9]*(\d[\d,]*)`,
+)
+
+// ParseOverflowTokens attempts to extract token counts from a context
+// overflow error body. Returns zero values if parsing fails —
+// callers should fall back to percentage-based compaction.
+func ParseOverflowTokens(body string) OverflowTokenGap {
+	m := overflowTokenRe.FindStringSubmatch(body)
+	if m == nil {
+		return OverflowTokenGap{}
+	}
+	var a, b int
+	if m[1] != "" && m[2] != "" {
+		a = parseTokenCount(m[1])
+		b = parseTokenCount(m[2])
+	} else if m[3] != "" && m[4] != "" {
+		b = parseTokenCount(m[3]) // limit
+		a = parseTokenCount(m[4]) // actual
+	}
+	if a > 0 && b > 0 {
+		return OverflowTokenGap{Actual: a, Limit: b}
+	}
+	return OverflowTokenGap{}
+}
+
+func parseTokenCount(s string) int {
+	s = strings.ReplaceAll(s, ",", "")
+	n, _ := strconv.Atoi(s)
+	return n
 }

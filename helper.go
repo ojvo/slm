@@ -702,6 +702,8 @@ func estimateChatPromptTokens(req *Request) int {
 				chars += len(string(value))
 			case ImagePart:
 				chars += len(value.URL) + len(value.Base64) + len(value.Detail) + len(value.MIME) + 32
+			case ThinkingPart:
+				chars += len(value.Content) + len(value.Signature) + 16
 			default:
 				chars += 16
 			}

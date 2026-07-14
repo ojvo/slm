@@ -83,6 +83,8 @@ type claudeImageSource struct {
 type claudeContent struct {
 	Type      string             `json:"type"`
 	Text      string             `json:"text,omitempty"`
+	Thinking  string             `json:"thinking,omitempty"`
+	Signature string             `json:"signature,omitempty"` // Anthropic extended thinking signature (required for replay)
 	ID        string             `json:"id,omitempty"`
 	Name      string             `json:"name,omitempty"`
 	Input     any                `json:"input,omitempty"`
@@ -123,6 +125,8 @@ type claudeStreamEvent struct {
 type claudeDelta struct {
 	Type        string `json:"type"`
 	Text        string `json:"text,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
+	Signature   string `json:"signature,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
 }
 
@@ -131,15 +135,17 @@ type claudeDelta struct {
 // -------------------------------------------------------------------------
 
 type claudeStreamIterator struct {
-	resp     *http.Response
-	framer   *sseFrameReader
-	codec    *claudeCodec
-	chunk    []byte
-	fullText string
-	usage    *Usage
-	current  *Response
-	err      error
-	done     bool
+	resp              *http.Response
+	framer            *sseFrameReader
+	codec             *claudeCodec
+	chunk             []byte
+	fullText          string
+	fullReasoning     string
+	thinkingSignature string
+	usage             *Usage
+	current           *Response
+	err               error
+	done              bool
 }
 
 func newClaudeStreamIterator(resp *http.Response, codec *claudeCodec) *claudeStreamIterator {
@@ -201,13 +207,21 @@ func (s *claudeStreamIterator) dispatch(frame sseFrame) bool {
 		s.chunk = nil
 		s.current = &Response{}
 
-		if event.Delta.Type == "text_delta" {
+		switch event.Delta.Type {
+		case "text_delta":
 			s.chunk = []byte(event.Delta.Text)
 			s.fullText += event.Delta.Text
 			s.current.Content = event.Delta.Text
-		} else if event.Delta.Type == "input_json_delta" {
+		case "input_json_delta":
 			s.chunk = []byte(event.Delta.PartialJSON)
 			s.current.Content = event.Delta.PartialJSON
+		case "thinking_delta":
+			s.chunk = []byte(event.Delta.Thinking)
+			s.fullReasoning += event.Delta.Thinking
+			s.current.ReasoningContent = event.Delta.Thinking
+		case "signature_delta":
+			s.thinkingSignature += event.Delta.Signature
+			s.current.ThinkingSignature = event.Delta.Signature
 		}
 		return len(s.chunk) > 0
 
@@ -243,6 +257,13 @@ func (s *claudeStreamIterator) Response() *Response {
 	if s.usage != nil && s.current.Usage == (Usage{}) {
 		s.current.Usage = *s.usage
 	}
+	// Populate accumulated reasoning content and signature from the full stream
+	if s.fullReasoning != "" && s.current.ReasoningContent == "" {
+		s.current.ReasoningContent = s.fullReasoning
+	}
+	if s.thinkingSignature != "" && s.current.ThinkingSignature == "" {
+		s.current.ThinkingSignature = s.thinkingSignature
+	}
 	return s.current
 }
 
@@ -272,6 +293,17 @@ func convertMessagesToClaude(messages []Message) []claudeMessage {
 
 		for _, part := range msg.Content {
 			switch p := part.(type) {
+			case ThinkingPart:
+				// Emit thinking block only when signature is present —
+				// Anthropic requires the signature for replay; sending
+				// a thinking block without it causes an API error.
+				if p.Signature != "" {
+					cm.Content = append(cm.Content, claudeContent{
+						Type:      "thinking",
+						Thinking:  p.Content,
+						Signature: p.Signature,
+					})
+				}
 			case TextPart:
 				cm.Content = append(cm.Content, claudeContent{
 					Type: "text",
@@ -375,12 +407,19 @@ func (c *claudeCodec) ConvertChatResponse(resp any) *Response {
 	}
 
 	content := ""
+	reasoningContent := ""
+	thinkingSignature := ""
 	var toolCalls []APIToolCall
 
 	for _, block := range claudeResp.Content {
 		switch block.Type {
 		case "text":
 			content += block.Text
+		case "thinking":
+			reasoningContent += block.Thinking
+			if block.Signature != "" {
+				thinkingSignature = block.Signature
+			}
 		case "tool_use":
 			args, _ := json.Marshal(block.Input)
 			toolCalls = append(toolCalls, APIToolCall{
@@ -403,9 +442,11 @@ func (c *claudeCodec) ConvertChatResponse(resp any) *Response {
 	}
 
 	return &Response{
-		Content:      content,
-		FinishReason: finishReason,
-		ToolCalls:    toolCalls,
-		Usage:        usage,
+		Content:           content,
+		ReasoningContent:  reasoningContent,
+		ThinkingSignature: thinkingSignature,
+		FinishReason:      finishReason,
+		ToolCalls:         toolCalls,
+		Usage:             usage,
 	}
 }

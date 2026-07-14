@@ -449,11 +449,26 @@ func convertMessages(messages []Message) []oaiMessage {
 	for i, msg := range messages {
 		oaiMsg := oaiMessage{Role: string(msg.Role), Name: msg.Name, ToolCallID: msg.ToolCallID}
 
-		switch len(msg.Content) {
+		// Extract ThinkingPart content for reasoning_content field.
+		// OpenAI/DeepSeek models use the reasoning_content field rather than
+		// a content block for thinking replay. ThinkingPart.Signature is
+		// Anthropic-specific and ignored here.
+		var contentParts []ContentPart
+		for _, part := range msg.Content {
+			if tp, ok := part.(ThinkingPart); ok {
+				if tp.Content != "" {
+					oaiMsg.ReasoningContent = tp.Content
+				}
+				continue
+			}
+			contentParts = append(contentParts, part)
+		}
+
+		switch len(contentParts) {
 		case 0:
 			oaiMsg.Content = nil
 		case 1:
-			switch p := msg.Content[0].(type) {
+			switch p := contentParts[0].(type) {
 			case TextPart:
 				oaiMsg.Content = string(p)
 			case ImagePart:
@@ -463,7 +478,7 @@ func convertMessages(messages []Message) []oaiMessage {
 			}
 		default:
 			var parts []map[string]any
-			for _, part := range msg.Content {
+			for _, part := range contentParts {
 				switch p := part.(type) {
 				case TextPart:
 					parts = append(parts, map[string]any{"type": "text", "text": string(p)})

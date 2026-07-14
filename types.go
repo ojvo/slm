@@ -41,6 +41,22 @@ type ImagePart struct {
 
 func (i ImagePart) isContentPart() {}
 
+// ThinkingPart represents extended thinking content from reasoning models
+// (DeepSeek-R1 reasoning_content, Anthropic Claude extended thinking).
+// It is a ContentPart so thinking can be replayed in tool loops: the Codec
+// layer converts it to the appropriate wire format (thinking block for
+// Claude, reasoning_content field for OpenAI/DeepSeek).
+//
+// Signature is required for Anthropic thinking block replay; other drivers
+// ignore it. It is analogous to how ImagePart.Base64 is a wire-transport
+// detail that some drivers use and others ignore.
+type ThinkingPart struct {
+	Content   string
+	Signature string // Anthropic extended thinking signature (required for replay)
+}
+
+func (t ThinkingPart) isContentPart() {}
+
 // APIToolCall represents a tool/function call emitted by the model.
 type APIToolCall struct {
 	Index     int    `json:"index,omitempty"`
@@ -115,19 +131,56 @@ func (r *Request) ValidateFor(engine Engine) error {
 
 // Response is the normalized chat response returned by Engine.
 type Response struct {
-	Content          string
-	ReasoningContent string
-	Usage            Usage
-	FinishReason     string
-	ToolCalls        []APIToolCall
-	Meta             map[string]any
+	Content           string
+	ReasoningContent  string
+	ThinkingSignature string // Anthropic extended thinking signature (populated on non-streaming responses)
+	Usage             Usage
+	FinishReason      string
+	ToolCalls         []APIToolCall
+	Meta              map[string]any
 }
 
 // Usage reports token accounting for chat/completions requests.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	CacheHitTokens      int                  `json:"prompt_cache_hit_tokens,omitempty"` // DeepSeek top-level
+	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`   // OpenAI/DeepSeek nested
+}
+
+// PromptTokensDetails holds nested cache hit data (OpenAI format).
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+// CacheMissTokens returns the number of prompt tokens that were NOT served
+// from cache. It normalizes across DeepSeek (top-level CacheHitTokens) and
+// OpenAI (nested PromptTokensDetails.CachedTokens) formats.
+func (u Usage) CacheMissTokens() int {
+	hit := u.CacheHitTokens
+	if hit == 0 && u.PromptTokensDetails != nil {
+		hit = u.PromptTokensDetails.CachedTokens
+	}
+	miss := u.PromptTokens - hit
+	if miss < 0 {
+		return 0
+	}
+	return miss
+}
+
+// TotalContextTokens returns the total context token occupancy including cache
+// hits. Cached tokens still occupy the model's context window and must not be
+// ignored — a fully-cached Claude session would look nearly empty if only
+// PromptTokens were checked, causing auto-compact to never trigger.
+//
+// For Anthropic: PromptTokens excludes cache_read, so the result = input +
+// output + cache_read (accurate).
+// For OpenAI: PromptTokens may already include cached_tokens, so the result
+// double-counts cache hits (overestimate). Overestimating is safe for compact
+// triggers (early compact is better than missed compact).
+func (u Usage) TotalContextTokens() int {
+	return u.PromptTokens + u.CompletionTokens + u.CacheHitTokens
 }
 
 // -----------------------------------------------------------------------------
