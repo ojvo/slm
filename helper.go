@@ -1,6 +1,7 @@
 package slm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -57,6 +58,47 @@ func NewImageMessage(imageURL string) Message {
 //	req.Temperature = slm.Float64(0.0)  // explicitly set to 0
 //	req.TopP = slm.Float64(0.9)
 func Float64(v float64) *float64 { return &v }
+
+// RequestOption is a functional option for Request.
+type RequestOption func(*Request)
+
+// WithJSONMode enables JSON mode on the request.
+func WithJSONMode(enabled bool) RequestOption {
+	return func(r *Request) { r.JSONMode = enabled }
+}
+
+// WithTemperature sets the temperature on the request.
+func WithTemperature(temp float64) RequestOption {
+	return func(r *Request) { r.Temperature = Float64(temp) }
+}
+
+// WithTools sets the tools on the request.
+func WithTools(tools []ToolSpec) RequestOption {
+	return func(r *Request) { r.Tools = tools }
+}
+
+// WithMaxTokens creates a RequestOption that sets MaxTokens.
+func WithMaxTokens(maxTokens int) RequestOption {
+	return func(r *Request) { r.MaxTokens = maxTokens }
+}
+
+// GenerateContent is a convenience function that calls Engine.Generate and
+// returns the response content string. It is the common pattern used by
+// agents that need a simple text/JSON response from the LLM.
+func GenerateContent(ctx context.Context, engine Engine, model string, messages []Message, opts ...RequestOption) (string, error) {
+	req := &Request{
+		Model:    model,
+		Messages: messages,
+	}
+	for _, opt := range opts {
+		opt(req)
+	}
+	resp, err := engine.Generate(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	return resp.Content, nil
+}
 
 func normalizeRequestForOperation(req *Request, defaultModel string, stream bool) *Request {
 	return normalizeForOperation(req, defaultModel, stream,

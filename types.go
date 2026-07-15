@@ -73,6 +73,35 @@ type Tool struct {
 	Parameters  any    `json:"parameters"`
 }
 
+// ToolSpec is an alias for Tool for compatibility with consumers that
+// use the ToolSpec name. Prefer Tool in new code.
+type ToolSpec = Tool
+
+// FunctionSpec is a generic interface for tool function specifications.
+// Any type with Name, Description, and Parameters fields can satisfy this
+// interface, enabling conversion from application-specific tool spec types
+// to slm.ToolSpec without slm depending on those types.
+type FunctionSpec interface {
+	GetName() string
+	GetDescription() string
+	GetParameters() any
+}
+
+// ToolsFromSpecs converts a slice of FunctionSpec implementations to []ToolSpec.
+// This enables consumers to convert their tool spec types without slm depending
+// on application-specific types.
+func ToolsFromSpecs[S FunctionSpec](specs []S) []ToolSpec {
+	result := make([]ToolSpec, len(specs))
+	for i, s := range specs {
+		result[i] = ToolSpec{
+			Name:        s.GetName(),
+			Description: s.GetDescription(),
+			Parameters:  s.GetParameters(),
+		}
+	}
+	return result
+}
+
 // Message is the package-level message model for chat-oriented requests.
 type Message struct {
 	Role       Role
@@ -80,6 +109,43 @@ type Message struct {
 	Name       string
 	ToolCalls  []APIToolCall
 	ToolCallID string
+	Meta       map[string]any // application-layer extension metadata (not serialized to LLM requests)
+}
+
+// SetMeta sets a single extension metadata key-value pair.
+func (m *Message) SetMeta(key string, val any) {
+	if m.Meta == nil {
+		m.Meta = make(map[string]any)
+	}
+	m.Meta[key] = val
+}
+
+// GetMeta returns the extension metadata value for the key, or nil if absent.
+func (m *Message) GetMeta(key string) any {
+	if m.Meta == nil {
+		return nil
+	}
+	return m.Meta[key]
+}
+
+// GetMetaString returns the extension metadata value as a string, or "" if
+// absent or not a string.
+func (m *Message) GetMetaString(key string) string {
+	v := m.GetMeta(key)
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// GetMetaStrings returns the extension metadata value as a []string, or nil
+// if absent or not a []string.
+func (m *Message) GetMetaStrings(key string) []string {
+	v := m.GetMeta(key)
+	if s, ok := v.([]string); ok {
+		return s
+	}
+	return nil
 }
 
 // Text returns the concatenated text content of the message.
@@ -92,6 +158,50 @@ func (m Message) Text() string {
 		}
 	}
 	return b.String()
+}
+
+// ReasoningContent returns the concatenated thinking content from ThinkingPart
+// values in the message. This is the protocol-agnostic way to access extended
+// thinking content that was previously stored as a wire-format field.
+func (m Message) ReasoningContent() string {
+	var b strings.Builder
+	for _, p := range m.Content {
+		if tp, ok := p.(ThinkingPart); ok {
+			b.WriteString(tp.Content)
+		}
+	}
+	return b.String()
+}
+
+// ThinkingSignature returns the signature from the first ThinkingPart in the
+// message, if any. Anthropic extended thinking requires this signature for
+// replay in tool loops.
+func (m Message) ThinkingSignature() string {
+	for _, p := range m.Content {
+		if tp, ok := p.(ThinkingPart); ok {
+			return tp.Signature
+		}
+	}
+	return ""
+}
+
+// SetReasoningContent replaces any existing ThinkingPart values in the
+// message content with a single ThinkingPart containing the given content
+// and signature. If content is empty, all ThinkingPart values are removed.
+func (m *Message) SetReasoningContent(content, signature string) {
+	var rest []ContentPart
+	for _, p := range m.Content {
+		if _, ok := p.(ThinkingPart); !ok {
+			rest = append(rest, p)
+		}
+	}
+	if content == "" && signature == "" {
+		m.Content = rest
+		return
+	}
+	// ThinkingPart is placed at the start to match Anthropic's wire ordering
+	// (thinking blocks precede other content).
+	m.Content = append([]ContentPart{ThinkingPart{Content: content, Signature: signature}}, rest...)
 }
 
 // -----------------------------------------------------------------------------

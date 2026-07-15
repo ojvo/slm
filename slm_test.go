@@ -2,12 +2,14 @@ package slm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1763,7 +1765,6 @@ func TestExponentialBackoffWithJitter_NoPanic(t *testing.T) {
 	}
 }
 
-
 func TestResponseInputDisplayText_String(t *testing.T) {
 	item := ResponseInputItem{Role: "user", Content: "hello"}
 	if got := ResponseInputDisplayText(item); got != "hello" {
@@ -1828,7 +1829,6 @@ func TestSummarizeNormalizedResponsesRequest(t *testing.T) {
 		t.Fatalf("expected summary to include response fields, got %s", summary)
 	}
 }
-
 
 func TestDetectContextOverflow_OpenAIStyle(t *testing.T) {
 	body := `{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 128000 tokens."}}`
@@ -1913,7 +1913,6 @@ func TestParseOverflowTokens_WithCommas(t *testing.T) {
 		t.Errorf("expected Limit 1350000, got %d", gap.Limit)
 	}
 }
-
 
 // --- ThinkingPart content part ---
 
@@ -2244,3 +2243,703 @@ func TestUsageJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// ============================================================================
+// Fallback Middleware Tests (from fallback_test.go)
+// ============================================================================
+
+// fallbackEngine is a controllable engine for testing FallbackMiddleware.
+// It records the model of each request it receives and returns the
+// configured response/error (unary) or iterator/error (stream).
+type fallbackEngine struct {
+	mu        sync.Mutex
+	models    []string // models seen by Generate/Stream, in order
+	resp      *Response
+	err       error
+	streamIt  StreamIterator
+	streamErr error
+}
+
+func (e *fallbackEngine) Generate(ctx context.Context, req *Request) (*Response, error) {
+	e.mu.Lock()
+	e.models = append(e.models, req.Model)
+	r, err := e.resp, e.err
+	e.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if r != nil {
+		return r, nil
+	}
+	return &Response{Content: "ok"}, nil
+}
+
+func (e *fallbackEngine) Stream(ctx context.Context, req *Request) (StreamIterator, error) {
+	e.mu.Lock()
+	e.models = append(e.models, req.Model)
+	it, err := e.streamIt, e.streamErr
+	e.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if it != nil {
+		return it, nil
+	}
+	return &stubIter{text: "ok"}, nil
+}
+
+func (e *fallbackEngine) Capabilities() *ProtocolCapabilities {
+	return &ProtocolCapabilities{Description: "fallback test engine"}
+}
+
+func (e *fallbackEngine) lastModel() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.models) == 0 {
+		return ""
+	}
+	return e.models[len(e.models)-1]
+}
+
+func (e *fallbackEngine) modelCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.models)
+}
+
+// TestIsOverloadError verifies that IsOverloadError correctly identifies
+// overload errors (ErrCodeOverloaded, ErrCodeRateLimit) and rejects
+// non-overload errors and non-LLMError errors.
+func TestIsOverloadError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"overloaded", NewLLMError(ErrCodeOverloaded, "overloaded", nil), true},
+		{"rate_limit", NewLLMError(ErrCodeRateLimit, "rate limit", nil), true},
+		{"timeout", NewLLMError(ErrCodeTimeout, "timeout", nil), false},
+		{"network", NewLLMError(ErrCodeNetwork, "network", nil), false},
+		{"server", NewLLMError(ErrCodeServer, "server", nil), false},
+		{"auth", NewLLMError(ErrCodeAuth, "auth", nil), false},
+		{"internal", NewLLMError(ErrCodeInternal, "internal", nil), false},
+		{"plain_error", errors.New("plain error"), false},
+		{"wrapped_overloaded", &wrappedErr{inner: NewLLMError(ErrCodeOverloaded, "wrapped", nil)}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IsOverloadError(tt.err)
+			if got != tt.want {
+				t.Errorf("IsOverloadError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+type wrappedErr struct{ inner error }
+
+func (w *wrappedErr) Error() string { return w.inner.Error() }
+func (w *wrappedErr) Unwrap() error { return w.inner }
+
+// TestFallback_NoopWhenNoFallbackModel verifies that an empty FallbackModel
+// makes the middleware a pass-through that does not swap models.
+func TestFallback_NoopWhenNoFallbackModel(t *testing.T) {
+	engine := &fallbackEngine{err: NewLLMError(ErrCodeOverloaded, "overloaded", nil)}
+	unary, stream := FallbackMiddlewareWithConfig(FallbackConfig{FallbackModel: ""})
+
+	chainUnary := unary(engine.Generate)
+	chainStream := stream(engine.Stream)
+
+	// Five overload errors should not trigger any swap because FallbackModel is empty.
+	for i := 0; i < 5; i++ {
+		_, _ = chainUnary(context.Background(), &Request{Model: "primary"})
+	}
+	if got := engine.lastModel(); got != "primary" {
+		t.Errorf("after 5 overload errors with empty FallbackModel, model = %q, want %q", got, "primary")
+	}
+
+	_, _ = chainStream(context.Background(), &Request{Model: "primary"})
+	if got := engine.lastModel(); got != "primary" {
+		t.Errorf("stream: after overload with empty FallbackModel, model = %q, want %q", got, "primary")
+	}
+}
+
+// TestFallback_NoSwapBeforeThreshold verifies that the model is not swapped
+// until the overload threshold is reached.
+func TestFallback_NoSwapBeforeThreshold(t *testing.T) {
+	engine := &fallbackEngine{err: NewLLMError(ErrCodeOverloaded, "overloaded", nil)}
+	unary, _ := FallbackMiddlewareWithConfig(FallbackConfig{
+		FallbackModel:     "fallback",
+		OverloadThreshold: 3,
+	})
+
+	chain := unary(engine.Generate)
+
+	// Two overload errors — below threshold, should still use primary.
+	for i := 0; i < 2; i++ {
+		_, _ = chain(context.Background(), &Request{Model: "primary"})
+	}
+	if got := engine.lastModel(); got != "primary" {
+		t.Errorf("after 2 overload errors (threshold=3), model = %q, want %q", got, "primary")
+	}
+}
+
+// TestFallback_SwapsAfterThreshold verifies that the model is swapped to
+// the fallback model after the overload threshold is reached.
+func TestFallback_SwapsAfterThreshold(t *testing.T) {
+	engine := &fallbackEngine{err: NewLLMError(ErrCodeOverloaded, "overloaded", nil)}
+	unary, _ := FallbackMiddlewareWithConfig(FallbackConfig{
+		FallbackModel:     "fallback",
+		OverloadThreshold: 3,
+	})
+
+	chain := unary(engine.Generate)
+
+	// Three overload errors — reaches threshold, next call should use fallback.
+	for i := 0; i < 3; i++ {
+		_, _ = chain(context.Background(), &Request{Model: "primary"})
+	}
+	// The 3rd error triggers usingFallback=true, but the 3rd call itself
+	// still used primary (state is checked at START of call). The 4th call
+	// should use fallback.
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	if got := engine.lastModel(); got != "fallback" {
+		t.Errorf("after 3 overload errors (threshold=3), 4th call model = %q, want %q", got, "fallback")
+	}
+}
+
+// TestFallback_RecoverOnSuccess verifies that a successful call resets
+// the fallback state back to primary.
+func TestFallback_RecoverOnSuccess(t *testing.T) {
+	// Phase 1: trigger fallback with threshold=1 and overload error.
+	engine := &fallbackEngine{err: NewLLMError(ErrCodeOverloaded, "overloaded", nil)}
+	unary, _ := FallbackMiddlewareWithConfig(FallbackConfig{
+		FallbackModel:     "fallback",
+		OverloadThreshold: 1,
+	})
+
+	chain := unary(engine.Generate)
+
+	// One overload error — threshold=1, next call should use fallback.
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+
+	// Phase 2: switch to success, call should use fallback (state already switched).
+	engine.err = nil
+	engine.resp = &Response{Content: "ok"}
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	if got := engine.lastModel(); got != "fallback" {
+		t.Errorf("after overload+success, call should still use fallback (state was switched before success), got %q", got)
+	}
+
+	// Phase 3: success was recorded, next call should recover to primary.
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	if got := engine.lastModel(); got != "primary" {
+		t.Errorf("after success, model should recover to primary, got %q", got)
+	}
+}
+
+// TestFallback_NonOverloadErrorNoSwitch verifies that non-overload errors
+// (e.g., network errors) do not trigger model swap.
+func TestFallback_NonOverloadErrorNoSwitch(t *testing.T) {
+	engine := &fallbackEngine{err: NewLLMError(ErrCodeNetwork, "network error", nil)}
+	unary, _ := FallbackMiddlewareWithConfig(FallbackConfig{
+		FallbackModel:     "fallback",
+		OverloadThreshold: 1,
+	})
+
+	chain := unary(engine.Generate)
+
+	// Multiple non-overload errors should not trigger swap.
+	for i := 0; i < 5; i++ {
+		_, _ = chain(context.Background(), &Request{Model: "primary"})
+	}
+	if got := engine.lastModel(); got != "primary" {
+		t.Errorf("after 5 non-overload errors, model = %q, want %q", got, "primary")
+	}
+}
+
+// TestFallback_CustomIsOverload verifies that a custom IsOverload predicate
+// is used instead of the default.
+func TestFallback_CustomIsOverload(t *testing.T) {
+	engine := &fallbackEngine{err: NewLLMError(ErrCodeServer, "server error", nil)}
+	customCalled := false
+	unary, _ := FallbackMiddlewareWithConfig(FallbackConfig{
+		FallbackModel:     "fallback",
+		OverloadThreshold: 1,
+		IsOverload: func(err error) bool {
+			customCalled = true
+			var llmErr *LLMError
+			if errors.As(err, &llmErr) {
+				return llmErr.Code == ErrCodeServer
+			}
+			return false
+		},
+	})
+
+	chain := unary(engine.Generate)
+
+	// ErrCodeServer is not an overload by default, but custom predicate treats it as one.
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	if !customCalled {
+		t.Fatal("custom IsOverload was not called")
+	}
+
+	// Now state should be switched (threshold=1), next call uses fallback.
+	engine.err = nil
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	if got := engine.lastModel(); got != "fallback" {
+		t.Errorf("custom IsOverload: after server error, model = %q, want %q", got, "fallback")
+	}
+}
+
+// TestFallback_DefaultsApplied verifies that default threshold (3) and
+// default IsOverload (IsOverloadError) are applied when zero-valued.
+func TestFallback_DefaultsApplied(t *testing.T) {
+	engine := &fallbackEngine{err: NewLLMError(ErrCodeOverloaded, "overloaded", nil)}
+	unary, _ := FallbackMiddlewareWithConfig(FallbackConfig{
+		FallbackModel: "fallback",
+		// OverloadThreshold and IsOverload left as zero values
+	})
+
+	chain := unary(engine.Generate)
+
+	// Default threshold is 3 — two errors should not trigger swap.
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	if got := engine.lastModel(); got != "primary" {
+		t.Errorf("default threshold=3: after 2 errors, model = %q, want %q", got, "primary")
+	}
+
+	// Third error reaches threshold, fourth call uses fallback.
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	engine.err = nil
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	if got := engine.lastModel(); got != "fallback" {
+		t.Errorf("default threshold=3: after 3 errors, 4th call model = %q, want %q", got, "fallback")
+	}
+}
+
+// TestFallback_StreamSwapsAfterThreshold verifies that the stream middleware
+// also swaps the model after the threshold is reached.
+func TestFallback_StreamSwapsAfterThreshold(t *testing.T) {
+	engine := &fallbackEngine{streamErr: NewLLMError(ErrCodeOverloaded, "overloaded", nil)}
+	_, stream := FallbackMiddlewareWithConfig(FallbackConfig{
+		FallbackModel:     "fallback",
+		OverloadThreshold: 1,
+	})
+
+	chain := stream(engine.Stream)
+
+	// One stream-open overload error — threshold=1, next call should use fallback.
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+
+	// Now state is switched, next stream call should use fallback.
+	engine.streamErr = nil
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	if got := engine.lastModel(); got != "fallback" {
+		t.Errorf("stream: after overload, model = %q, want %q", got, "fallback")
+	}
+}
+
+// TestFallback_StreamNoopWhenNoFallbackModel verifies that the stream
+// middleware is a no-op when FallbackModel is empty.
+func TestFallback_StreamNoopWhenNoFallbackModel(t *testing.T) {
+	engine := &fallbackEngine{streamErr: NewLLMError(ErrCodeOverloaded, "overloaded", nil)}
+	_, stream := FallbackMiddlewareWithConfig(FallbackConfig{FallbackModel: ""})
+
+	chain := stream(engine.Stream)
+
+	for i := 0; i < 5; i++ {
+		_, _ = chain(context.Background(), &Request{Model: "primary"})
+	}
+	if got := engine.lastModel(); got != "primary" {
+		t.Errorf("stream: after 5 overload errors with empty FallbackModel, model = %q, want %q", got, "primary")
+	}
+}
+
+// TestFallback_ConcurrentSafe verifies that the middleware does not race
+// when called concurrently. This is a best-effort race detector test.
+func TestFallback_ConcurrentSafe(t *testing.T) {
+	engine := &fallbackEngine{err: NewLLMError(ErrCodeOverloaded, "overloaded", nil)}
+	unary, _ := FallbackMiddlewareWithConfig(FallbackConfig{
+		FallbackModel:     "fallback",
+		OverloadThreshold: 2,
+	})
+
+	chain := unary(engine.Generate)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = chain(context.Background(), &Request{Model: "primary"})
+		}()
+	}
+	wg.Wait()
+
+	// After 10 concurrent overload errors, state should be usingFallback=true.
+	// A subsequent call should use fallback.
+	engine.err = nil
+	_, _ = chain(context.Background(), &Request{Model: "primary"})
+	if got := engine.lastModel(); got != "fallback" {
+		t.Errorf("concurrent: after 10 overload errors, model = %q, want %q", got, "fallback")
+	}
+}
+
+// TestFallback_OriginalRequestNotMutated verifies that maybeSwap does not
+// modify the original request passed by the caller.
+func TestFallback_OriginalRequestNotMutated(t *testing.T) {
+	engine := &fallbackEngine{err: NewLLMError(ErrCodeOverloaded, "overloaded", nil)}
+	unary, _ := FallbackMiddlewareWithConfig(FallbackConfig{
+		FallbackModel:     "fallback",
+		OverloadThreshold: 1,
+	})
+
+	chain := unary(engine.Generate)
+
+	origReq := &Request{Model: "primary"}
+	_, _ = chain(context.Background(), origReq)
+	if origReq.Model != "primary" {
+		t.Errorf("original request model was mutated: got %q, want %q", origReq.Model, "primary")
+	}
+
+	// After threshold reached, next call should swap but original should be unchanged.
+	engine.err = nil
+	_, _ = chain(context.Background(), origReq)
+	if origReq.Model != "primary" {
+		t.Errorf("original request model was mutated after swap: got %q, want %q", origReq.Model, "primary")
+	}
+}
+
+// ============================================================================
+// Stream Collect Tests (from stream_collect_test.go)
+// ============================================================================
+
+// chunkIter is a controllable StreamIterator that yields a list of text
+// chunks one by one. It optionally returns a terminal error after the
+// last chunk.
+type chunkIter struct {
+	chunks []string
+	idx    int
+	err    error // returned by Err() after chunks are exhausted
+	closed bool
+}
+
+func (i *chunkIter) Next() bool {
+	if i.idx >= len(i.chunks) {
+		return false
+	}
+	i.idx++
+	return true
+}
+func (i *chunkIter) Chunk() []byte {
+	if i.idx == 0 {
+		return nil
+	}
+	return []byte(i.chunks[i.idx-1])
+}
+func (i *chunkIter) Text() string {
+	if i.idx == 0 {
+		return ""
+	}
+	return i.chunks[i.idx-1]
+}
+func (i *chunkIter) FullText() string {
+	var sb strings.Builder
+	for _, c := range i.chunks {
+		sb.WriteString(c)
+	}
+	return sb.String()
+}
+func (i *chunkIter) Err() error { return i.err }
+func (i *chunkIter) Close() error {
+	i.closed = true
+	return nil
+}
+func (i *chunkIter) Usage() *Usage       { return nil }
+func (i *chunkIter) Response() *Response { return nil }
+
+// streamCollectEngine is a controllable Engine for testing StreamAndCollect.
+type streamCollectEngine struct {
+	iter    StreamIterator
+	iterErr error // returned by Stream (open error)
+}
+
+func (e *streamCollectEngine) Generate(context.Context, *Request) (*Response, error) {
+	return &Response{Content: "ok"}, nil
+}
+func (e *streamCollectEngine) Stream(context.Context, *Request) (StreamIterator, error) {
+	if e.iterErr != nil {
+		return nil, e.iterErr
+	}
+	return e.iter, nil
+}
+func (e *streamCollectEngine) Capabilities() *ProtocolCapabilities {
+	return &ProtocolCapabilities{Description: "stream collect test engine"}
+}
+
+// TestStreamAndCollect_BasicCollection verifies that StreamAndCollect
+// accumulates all chunks into the returned string.
+func TestStreamAndCollect_BasicCollection(t *testing.T) {
+	engine := &streamCollectEngine{
+		iter: &chunkIter{chunks: []string{"Hello", ", ", "world", "!"}},
+	}
+
+	got, err := StreamAndCollect(context.Background(), engine, &Request{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "Hello, world!"; got != want {
+		t.Errorf("collected = %q, want %q", got, want)
+	}
+}
+
+// TestStreamAndCollect_CallbackInvoked verifies that the callback is
+// called for each chunk with the correct text.
+func TestStreamAndCollect_CallbackInvoked(t *testing.T) {
+	engine := &streamCollectEngine{
+		iter: &chunkIter{chunks: []string{"a", "b", "c"}},
+	}
+
+	var seen []string
+	ctx := WithStreamCallback(context.Background(), func(chunk string) error {
+		seen = append(seen, chunk)
+		return nil
+	})
+
+	_, err := StreamAndCollect(ctx, engine, &Request{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("callback called %d times, want 3", len(seen))
+	}
+	if want := []string{"a", "b", "c"}; !sliceEqual(seen, want) {
+		t.Errorf("callback saw %v, want %v", seen, want)
+	}
+}
+
+// TestStreamAndCollect_CallbackErrorStopsIteration verifies that a
+// callback error stops iteration immediately and returns that error.
+func TestStreamAndCollect_CallbackErrorStopsIteration(t *testing.T) {
+	iter := &chunkIter{chunks: []string{"a", "b", "c"}}
+	engine := &streamCollectEngine{iter: iter}
+
+	cbErr := errors.New("callback stop")
+	ctx := WithStreamCallback(context.Background(), func(chunk string) error {
+		if chunk == "b" {
+			return cbErr
+		}
+		return nil
+	})
+
+	_, err := StreamAndCollect(ctx, engine, &Request{})
+	if !errors.Is(err, cbErr) {
+		t.Errorf("error = %v, want %v", err, cbErr)
+	}
+	// "c" should not have been delivered to the callback.
+	if iter.idx != 2 {
+		t.Errorf("iteration continued after callback error: idx = %d, want 2", iter.idx)
+	}
+}
+
+// TestStreamAndCollect_MaxSizeExceeded verifies that exceeding
+// maxStreamContentSize returns an error.
+func TestStreamAndCollect_MaxSizeExceeded(t *testing.T) {
+	// Single chunk just over the limit.
+	oversized := strings.Repeat("x", maxStreamContentSize+1)
+	engine := &streamCollectEngine{
+		iter: &chunkIter{chunks: []string{oversized}},
+	}
+
+	_, err := StreamAndCollect(context.Background(), engine, &Request{})
+	if err == nil {
+		t.Fatal("expected max size error, got nil")
+	}
+	if !strings.Contains(err.Error(), "max size") {
+		t.Errorf("error = %v, want it to contain 'max size'", err)
+	}
+}
+
+// TestStreamAndCollect_MaxSizeBoundary verifies that a stream exactly at
+// the limit does NOT trigger the error (the check is strictly greater-than).
+func TestStreamAndCollect_MaxSizeBoundary(t *testing.T) {
+	atLimit := strings.Repeat("x", maxStreamContentSize)
+	engine := &streamCollectEngine{
+		iter: &chunkIter{chunks: []string{atLimit}},
+	}
+
+	got, err := StreamAndCollect(context.Background(), engine, &Request{})
+	if err != nil {
+		t.Fatalf("unexpected error at boundary: %v", err)
+	}
+	if len(got) != maxStreamContentSize {
+		t.Errorf("collected length = %d, want %d", len(got), maxStreamContentSize)
+	}
+}
+
+// TestStreamAndCollect_StreamError verifies that iter.Err() is propagated.
+func TestStreamAndCollect_StreamError(t *testing.T) {
+	streamErr := NewLLMError(ErrCodeServer, "stream failed", nil)
+	engine := &streamCollectEngine{
+		iter: &chunkIter{chunks: []string{"a"}, err: streamErr},
+	}
+
+	_, err := StreamAndCollect(context.Background(), engine, &Request{})
+	if !errors.Is(err, streamErr) {
+		t.Errorf("error = %v, want %v", err, streamErr)
+	}
+}
+
+// TestStreamAndCollect_NilCallbackNoop verifies that StreamAndCollect
+// works normally when no callback is injected.
+func TestStreamAndCollect_NilCallbackNoop(t *testing.T) {
+	engine := &streamCollectEngine{
+		iter: &chunkIter{chunks: []string{"hello", "world"}},
+	}
+
+	// No WithStreamCallback — plain ctx.
+	got, err := StreamAndCollect(context.Background(), engine, &Request{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "helloworld"; got != want {
+		t.Errorf("collected = %q, want %q", got, want)
+	}
+}
+
+// TestStreamAndCollect_RequestNotMutated verifies that the input request
+// is not mutated (Stream field should remain false).
+func TestStreamAndCollect_RequestNotMutated(t *testing.T) {
+	engine := &streamCollectEngine{
+		iter: &chunkIter{chunks: []string{"ok"}},
+	}
+
+	req := &Request{Model: "test-model", Stream: false}
+	_, _ = StreamAndCollect(context.Background(), engine, req)
+	if req.Stream {
+		t.Errorf("input request Stream was mutated to true")
+	}
+	if req.Model != "test-model" {
+		t.Errorf("input request Model was mutated: got %q", req.Model)
+	}
+}
+
+// TestStreamAndCollect_NilRequestHandled verifies that a nil request
+// does not panic (cloneRequest returns nil, StreamAndCollect creates &Request{}).
+func TestStreamAndCollect_NilRequestHandled(t *testing.T) {
+	engine := &streamCollectEngine{
+		iter: &chunkIter{chunks: []string{"ok"}},
+	}
+
+	got, err := StreamAndCollect(context.Background(), engine, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "ok" {
+		t.Errorf("collected = %q, want %q", got, "ok")
+	}
+}
+
+// TestStreamAndCollect_StreamOpenError verifies that an error from
+// engine.Stream (open failure) is propagated without calling the iterator.
+func TestStreamAndCollect_StreamOpenError(t *testing.T) {
+	openErr := NewLLMError(ErrCodeNetwork, "connection refused", nil)
+	engine := &streamCollectEngine{iterErr: openErr}
+
+	_, err := StreamAndCollect(context.Background(), engine, &Request{})
+	if !errors.Is(err, openErr) {
+		t.Errorf("error = %v, want %v", err, openErr)
+	}
+}
+
+// TestStreamAndCollect_EmptyStream verifies that an empty stream (no chunks)
+// returns an empty string without error.
+func TestStreamAndCollect_EmptyStream(t *testing.T) {
+	engine := &streamCollectEngine{
+		iter: &chunkIter{chunks: nil},
+	}
+
+	got, err := StreamAndCollect(context.Background(), engine, &Request{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("collected = %q, want empty", got)
+	}
+}
+
+// TestStreamAndCollect_IteratorClosed verifies that the iterator's Close
+// method is called after StreamAndCollect completes.
+func TestStreamAndCollect_IteratorClosed(t *testing.T) {
+	iter := &chunkIter{chunks: []string{"ok"}}
+	engine := &streamCollectEngine{iter: iter}
+
+	_, _ = StreamAndCollect(context.Background(), engine, &Request{})
+	if !iter.closed {
+		t.Error("iterator was not closed")
+	}
+}
+
+// TestStreamAndCollect_IteratorClosedOnError verifies that Close is called
+// even when an error occurs.
+func TestStreamAndCollect_IteratorClosedOnError(t *testing.T) {
+	iter := &chunkIter{
+		chunks: []string{"a"},
+		err:    NewLLMError(ErrCodeServer, "fail", nil),
+	}
+	engine := &streamCollectEngine{iter: iter}
+
+	_, _ = StreamAndCollect(context.Background(), engine, &Request{})
+	if !iter.closed {
+		t.Error("iterator was not closed on error")
+	}
+}
+
+// TestWithStreamCallback_NilCallbackReturnsOriginalCtx verifies that
+// passing a nil callback returns the original context unchanged.
+func TestWithStreamCallback_NilCallbackReturnsOriginalCtx(t *testing.T) {
+	ctx := context.Background()
+	result := WithStreamCallback(ctx, nil)
+	if result != ctx {
+		t.Error("nil callback should return original context")
+	}
+}
+
+// TestStreamCallbackFromCtx_NoCallbackReturnsNil verifies that extracting
+// from a context without a callback returns nil.
+func TestStreamCallbackFromCtx_NoCallbackReturnsNil(t *testing.T) {
+	cb := StreamCallbackFromCtx(context.Background())
+	if cb != nil {
+		t.Error("expected nil callback from plain context")
+	}
+}
+
+// TestStreamCallbackFromCtx_RoundTrip verifies that a callback injected
+// via WithStreamCallback can be extracted via StreamCallbackFromCtx.
+func TestStreamCallbackFromCtx_RoundTrip(t *testing.T) {
+	original := StreamChunkCallback(func(s string) error { return nil })
+	ctx := WithStreamCallback(context.Background(), original)
+	extracted := StreamCallbackFromCtx(ctx)
+	if extracted == nil {
+		t.Fatal("expected non-nil callback after injection")
+	}
+	// Verify it's callable.
+	if err := extracted("test"); err != nil {
+		t.Errorf("extracted callback returned error: %v", err)
+	}
+}
+
+func sliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
